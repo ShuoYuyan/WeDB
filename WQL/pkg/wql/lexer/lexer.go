@@ -69,6 +69,12 @@ func (l *Lexer) NextToken() Token {
 	case ']':
 		tok = Token{Type: TOKEN_RBRACKET, Value: "]", Line: l.line, Column: l.column}
 		l.readChar()
+	case '{':
+		tok = Token{Type: TOKEN_LBRACE, Value: "{", Line: l.line, Column: l.column}
+		l.readChar()
+	case '}':
+		tok = Token{Type: TOKEN_RBRACE, Value: "}", Line: l.line, Column: l.column}
+		l.readChar()
 	case ',':
 		tok = Token{Type: TOKEN_COMMA, Value: ",", Line: l.line, Column: l.column}
 		l.readChar()

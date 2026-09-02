@@ -176,6 +176,90 @@ Bye!
 > wql-cli test.db 'T("users").Where("age > 18").All()'
 ```
 
+## DML / DDL 无双引号语法
+
+WQL v3 支持完整的 DML/DDL 链式语法，全部无需双引号：
+
+### CREATE TABLE / DROP TABLE
+
+```go
+// 创建表
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `
+    db.Table(products).Create(id INTEGER PRIMARY KEY, name TEXT, price REAL).Execute()
+`)
+
+// 删除表
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(temp).Drop().Execute()`)
+```
+
+支持类型：`INTEGER`, `TEXT`, `REAL`, `BLOB`（`INT`/`VARCHAR`/`FLOAT`/`DOUBLE` 也可识别）
+支持约束：`PRIMARY KEY`, `NOT NULL`, `NULL`
+
+### INSERT
+
+```go
+// 对象字面量形式
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `
+    db.Table(users).Insert({id: 1, name: "alice", age: 30}).Execute()
+`)
+
+// 列值对形式
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `
+    db.Table(users).Insert(id, 2, name, "bob", age, 25).Execute()
+`)
+
+// 多行
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `
+    db.Table(users).Insert(
+        {id: 1, name: "alice", age: 30},
+        {id: 2, name: "bob", age: 25}
+    ).Execute()
+`)
+```
+
+### UPDATE (Set + Where)
+
+```go
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `
+    db.Table(users).Set(age, 31).Where(id = 1).Execute()
+`)
+```
+
+### DELETE (Where + Delete)
+
+```go
+_, err := wqlv3.EvaluateQueryNoQuotes(wdb, `
+    db.Table(users).Where(age < 18).Delete().Execute()
+`)
+```
+
+### 完整生命周期示例
+
+```go
+// 1. 建表
+wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).Create(
+    id INTEGER PRIMARY KEY, product TEXT, qty INTEGER
+).Execute()`)
+
+// 2. 插数据
+wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).Insert(
+    {id: 1, product: "apple", qty: 10},
+    {id: 2, product: "banana", qty: 20}
+).Execute()`)
+
+// 3. 查
+res, _ := wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).All()`)
+
+// 4. 改
+wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).Set(qty, 100).Where(product = "apple").Execute()`)
+
+// 5. 删
+wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).Where(qty < 50).Delete().Execute()`)
+
+// 6. 删表
+wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).Drop().Execute()`)
+```
+
 ## WHERE 子句语法
 
 支持的运算符和表达式：
@@ -232,11 +316,14 @@ go test ./pkg/wqlv3/
 - ✅ SELECT（带列过滤、WHERE、ORDER BY、SKIP、TAKE）
 - ✅ INSERT / UPDATE / DELETE（DML 完整支持）
 - ✅ CREATE TABLE / DROP TABLE（DDL 基础支持）
-- ✅ 聚合（Count, Sum, Avg, Min, Max — 通过 Go API）
-- ✅ WHERE 过滤（=, !=, <, >, AND, OR, NOT, IN, LIKE, IS NULL, IS NOT NULL）
-- ✅ WQL 无双引号解析器（lexer + parser + AST）
-- ❌ JOIN（parser 暂不支持）
-- ❌ GROUP BY / HAVING（parser 暂不支持）
+  - ✅ 聚合（Count, Sum, Avg, Min, Max — 通过 Go API）
+  - ✅ WHERE 过滤（=, !=, <, >, AND, OR, NOT, IN, LIKE, IS NULL, IS NOT NULL）
+  - ✅ WQL 无双引号解析器（lexer + parser + AST）
+  - ✅ DML: Insert / Update (Set+Where) / Delete (Where+Delete)
+  - ✅ DDL: CreateTable / DropTable
+  - ✅ 对象字面量 `{col: val, ...}` 用于 Insert/Set
+  - ❌ JOIN（parser 暂不支持）
+  - ❌ GROUP BY / HAVING（parser 暂不支持）
 - ❌ 嵌套子查询（parser 暂不支持）
 - ❌ 窗口函数（待实现）
 

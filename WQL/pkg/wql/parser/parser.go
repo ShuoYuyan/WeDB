@@ -134,6 +134,18 @@ func (p *Parser) parseOperation() (Operation, error) {
 		return p.parseIntersectOperation()
 	case lexer.TOKEN_EXCEPT:
 		return p.parseExceptOperation()
+	case lexer.TOKEN_INSERT:
+		return p.parseInsertOperation()
+	case lexer.TOKEN_SET:
+		return p.parseSetOperation()
+	case lexer.TOKEN_DELETE:
+		return p.parseDeleteOperation()
+	case lexer.TOKEN_CREATE:
+		return p.parseCreateTableOperation()
+	case lexer.TOKEN_DROP:
+		return p.parseDropTableOperation()
+	case lexer.TOKEN_EXECUTE:
+		return p.parseExecuteOperation()
 	default:
 		return nil, fmt.Errorf("unknown operation: %s", p.currentToken.Type)
 	}
@@ -741,4 +753,329 @@ func ParseString(input string) (*WQLQuery, error) {
 	lex := lexer.NewLexer(input)
 	p := NewParser(lex)
 	return p.Parse()
+}
+
+// parseInsertOperation 解析 INSERT 操作
+// 语法: .Insert(col1, val1, col2, val2, ...).Execute()
+//        .Insert({col1: val1, col2: val2}).Execute()  (单行)
+// 为了简单，采用 (col, val) 对列表形式
+func (p *Parser) parseInsertOperation() (*InsertOperation, error) {
+	// 当前 token 是 Insert
+	p.nextToken() // 跳过 Insert
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Insert, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 (
+
+	rows := []Expression{}
+
+	// 解析多行：每行是 {col1: val1, col2: val2, ...} 形式
+	// 简化: Insert(一对对 col, val, col, val...)
+	// 我们解析成单行: 一对 (col,val) 对组成一个 map literal
+	if p.currentToken.Type == lexer.TOKEN_LBRACE {
+		// 对象字面量 {col: val, ...}
+		obj, err := p.parseObjectLiteral()
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, obj)
+
+		if p.currentToken.Type == lexer.TOKEN_COMMA {
+			p.nextToken()
+			for p.currentToken.Type != lexer.TOKEN_RPAREN {
+				obj2, err := p.parseObjectLiteral()
+				if err != nil {
+					return nil, err
+				}
+				rows = append(rows, obj2)
+				if p.currentToken.Type == lexer.TOKEN_COMMA {
+					p.nextToken()
+				} else {
+					break
+				}
+			}
+		}
+	} else {
+		// 配对形式: col1, val1, col2, val2, ...
+		row := &ObjectLiteralExpression{Fields: []ObjectField{}}
+		for p.currentToken.Type != lexer.TOKEN_RPAREN {
+			col, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			if p.currentToken.Type != lexer.TOKEN_COMMA {
+				return nil, fmt.Errorf("expected ',' after column name in Insert, got %s", p.currentToken.Type)
+			}
+			p.nextToken() // 跳过 ,
+			val, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			row.Fields = append(row.Fields, ObjectField{Key: col, Value: val})
+			if p.currentToken.Type == lexer.TOKEN_COMMA {
+				p.nextToken()
+			} else {
+				break
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close Insert, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 )
+
+	// Insert 必须依赖 db.Table 提供的表名, 返回的 Operation 暂留 Table 为 nil，
+	// 在 buildQueryBuilder 中通过 query.Source 填充
+	return &InsertOperation{Table: nil, Rows: rows}, nil
+}
+
+// parseObjectLiteral 解析 {key: val, key: val, ...}
+func (p *Parser) parseObjectLiteral() (Expression, error) {
+	if p.currentToken.Type != lexer.TOKEN_LBRACE {
+		return nil, fmt.Errorf("expected '{', got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 {
+
+	obj := &ObjectLiteralExpression{Fields: []ObjectField{}}
+	for p.currentToken.Type != lexer.TOKEN_RBRACE {
+		// key 可以是 identifier 或 string
+		var key Expression
+		switch p.currentToken.Type {
+		case lexer.TOKEN_IDENTIFIER, lexer.TOKEN_STRING:
+			key = &Identifier{Value: p.currentToken.Value}
+			p.nextToken()
+		default:
+			return nil, fmt.Errorf("expected key in object literal, got %s", p.currentToken.Type)
+		}
+		if p.currentToken.Type != lexer.TOKEN_COLON {
+			return nil, fmt.Errorf("expected ':' after key, got %s", p.currentToken.Type)
+		}
+		p.nextToken() // 跳过 :
+		val, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		obj.Fields = append(obj.Fields, ObjectField{Key: key, Value: val})
+		if p.currentToken.Type == lexer.TOKEN_COMMA {
+			p.nextToken()
+		} else {
+			break
+		}
+	}
+	if p.currentToken.Type != lexer.TOKEN_RBRACE {
+		return nil, fmt.Errorf("expected '}' to close object, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 }
+	return obj, nil
+}
+
+// parseSetOperation 解析 SET 操作（用于 UPDATE）
+// 语法: .Set(col1, val1, col2, val2, ...).Where(...).Execute()
+func (p *Parser) parseSetOperation() (*SetOperation, error) {
+	p.nextToken() // 跳过 Set
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Set, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 (
+
+	updates := []Expression{}
+	if p.currentToken.Type == lexer.TOKEN_LBRACE {
+		obj, err := p.parseObjectLiteral()
+		if err != nil {
+			return nil, err
+		}
+		updates = append(updates, obj)
+	} else {
+		// 配对形式
+		row := &ObjectLiteralExpression{Fields: []ObjectField{}}
+		for p.currentToken.Type != lexer.TOKEN_RPAREN {
+			col, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			if p.currentToken.Type != lexer.TOKEN_COMMA {
+				return nil, fmt.Errorf("expected ',' after column in Set, got %s", p.currentToken.Type)
+			}
+			p.nextToken()
+			val, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			row.Fields = append(row.Fields, ObjectField{Key: col, Value: val})
+			if p.currentToken.Type == lexer.TOKEN_COMMA {
+				p.nextToken()
+			} else {
+				break
+			}
+		}
+		updates = append(updates, row)
+	}
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close Set, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	return &SetOperation{Updates: updates}, nil
+}
+
+// parseDeleteOperation 解析 DELETE 操作
+// 语法: .Delete()  （条件通过前面的 Where 提供）
+func (p *Parser) parseDeleteOperation() (*DeleteOperation, error) {
+	p.nextToken() // 跳过 Delete
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Delete, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close Delete, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	return &DeleteOperation{Table: nil, Condition: nil}, nil
+}
+
+// parseCreateTableOperation 解析 CREATE TABLE 操作
+// 语法: .Create(col1 TYPE, col2 TYPE, ..., colN TYPE).Execute()
+func (p *Parser) parseCreateTableOperation() (*CreateTableOperation, error) {
+	p.nextToken() // 跳过 Create
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Create, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	cols := []ColumnDef{}
+	for p.currentToken.Type != lexer.TOKEN_RPAREN {
+		if p.currentToken.Type != lexer.TOKEN_IDENTIFIER {
+			return nil, fmt.Errorf("expected column name in Create, got %s", p.currentToken.Type)
+		}
+		colName := p.currentToken.Value
+		p.nextToken()
+
+		// 类型
+		colType, err := p.parseColumnType()
+		if err != nil {
+			return nil, err
+		}
+
+		col := ColumnDef{Name: colName, Type: colType, Nullable: true, Primary: false}
+
+		// 可选约束: PRIMARY KEY, NOT NULL, NULL
+		for {
+			switch p.currentToken.Type {
+			case lexer.TOKEN_PRIMARY:
+				p.nextToken()
+				if p.currentToken.Type == lexer.TOKEN_KEY {
+					p.nextToken()
+				}
+				col.Primary = true
+				col.Nullable = false
+			case lexer.TOKEN_NOT:
+				p.nextToken()
+				if p.currentToken.Type == lexer.TOKEN_NULL {
+					p.nextToken()
+				}
+				col.Nullable = false
+			case lexer.TOKEN_NULL:
+				p.nextToken()
+				col.Nullable = true
+			default:
+				goto doneConstraints
+			}
+		}
+	doneConstraints:
+		cols = append(cols, col)
+
+		if p.currentToken.Type == lexer.TOKEN_COMMA {
+			p.nextToken()
+		} else {
+			break
+		}
+	}
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close Create, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	return &CreateTableOperation{Table: nil, Columns: cols}, nil
+}
+
+// parseColumnType 解析列类型: INTEGER, TEXT, REAL, BLOB
+func (p *Parser) parseColumnType() (string, error) {
+	switch p.currentToken.Type {
+	case lexer.TOKEN_INTEGER_TYPE:
+		p.nextToken()
+		return "INTEGER", nil
+	case lexer.TOKEN_TEXT_TYPE:
+		p.nextToken()
+		return "TEXT", nil
+	case lexer.TOKEN_REAL_TYPE:
+		p.nextToken()
+		return "REAL", nil
+	case lexer.TOKEN_BLOB_TYPE:
+		p.nextToken()
+		return "BLOB", nil
+	case lexer.TOKEN_IDENTIFIER:
+		// 允许自定义类型 (大小写不敏感匹配)
+		upper := strings.ToUpper(p.currentToken.Value)
+		switch upper {
+		case "INTEGER", "INT":
+			p.nextToken()
+			return "INTEGER", nil
+		case "TEXT", "VARCHAR", "STRING":
+			p.nextToken()
+			return "TEXT", nil
+		case "REAL", "FLOAT", "DOUBLE":
+			p.nextToken()
+			return "REAL", nil
+		case "BLOB":
+			p.nextToken()
+			return "BLOB", nil
+		}
+		return "", fmt.Errorf("unknown column type: %s", p.currentToken.Value)
+	}
+	return "", fmt.Errorf("expected column type, got %s", p.currentToken.Type)
+}
+
+// parseDropTableOperation 解析 DROP TABLE
+// 语法: .Drop()
+func (p *Parser) parseDropTableOperation() (*DropTableOperation, error) {
+	p.nextToken() // 跳过 Drop
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Drop, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close Drop, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	return &DropTableOperation{Table: nil}, nil
+}
+
+// parseExecuteOperation 解析 Execute() 终结符
+func (p *Parser) parseExecuteOperation() (*ExecuteOperation, error) {
+	p.nextToken() // 跳过 Execute
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Execute, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close Execute, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	return &ExecuteOperation{Terminator: true}, nil
 }

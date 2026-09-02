@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"strings"
 )
 
 // Node AST节点接口
@@ -53,6 +54,18 @@ type Operation interface {
 type OperationImpl struct{}
 
 func (o OperationImpl) operationNode() {}
+
+// DMLOperation DML操作（INSERT/UPDATE/DELETE）的统一接口
+type DMLOperation interface {
+	Operation
+	dmlNode()
+}
+
+// DDLOperation DDL操作（CREATE/DROP）的统一接口
+type DDLOperation interface {
+	Operation
+	ddlNode()
+}
 
 // TableOperation 表操作
 type TableOperation struct {
@@ -199,7 +212,172 @@ func (a *AllOperation) String() string {
 
 func (a *AllOperation) operationNode() {}
 
-// AggregateOperation 聚合操作
+// ===== DML Operations =====
+
+// InsertOperation INSERT 操作
+// 语法: db.Table(users).Insert({id: 1, name: "alice", age: 30}).Execute()
+//     db.Table(users).Insert({id: 1, name: "alice"}, {id: 2, name: "bob"}).Execute()
+type InsertOperation struct {
+	Table Expression // 表名（来自 db.Table(name)）
+	Rows  []Expression // 值列表，每个是 {col: val, ...} 形式的对象表达式
+}
+
+func (i *InsertOperation) String() string {
+	rows := make([]string, len(i.Rows))
+	for idx, r := range i.Rows {
+		rows[idx] = r.String()
+	}
+	return fmt.Sprintf("Insert(%s, [%s])", i.Table, fmt.Sprintf("%v", rows))
+}
+
+func (i *InsertOperation) operationNode() {}
+func (i *InsertOperation) dmlNode()      {}
+
+// UpdateOperation UPDATE 操作
+// 语法: db.Table(users).Set(name, "alice").Where(id = 1).Execute()
+type UpdateOperation struct {
+	Table     Expression // 表名
+	Updates   []Expression // Set 调用的列=值对列表
+	Condition Expression // WHERE 条件（可选）
+}
+
+func (u *UpdateOperation) String() string {
+	updates := make([]string, len(u.Updates))
+	for idx, u2 := range u.Updates {
+		updates[idx] = u2.String()
+	}
+	if u.Condition != nil {
+		return fmt.Sprintf("Update(%s, Set=[%s], Where=%s)", u.Table, fmt.Sprintf("%v", updates), u.Condition)
+	}
+	return fmt.Sprintf("Update(%s, Set=[%s])", u.Table, fmt.Sprintf("%v", updates))
+}
+
+func (u *UpdateOperation) operationNode() {}
+func (u *UpdateOperation) dmlNode()      {}
+
+// DeleteOperation DELETE 操作
+// 语法: db.Table(users).Where(age < 18).Delete().Execute()
+type DeleteOperation struct {
+	Table     Expression // 表名
+	Condition Expression // WHERE 条件（可选）
+}
+
+func (d *DeleteOperation) String() string {
+	if d.Condition != nil {
+		return fmt.Sprintf("Delete(%s, Where=%s)", d.Table, d.Condition)
+	}
+	return fmt.Sprintf("Delete(%s)", d.Table)
+}
+
+func (d *DeleteOperation) operationNode() {}
+func (d *DeleteOperation) dmlNode()      {}
+
+// SetOperation UPDATE 的 SET 子句
+// 语法: .Set(col1, val1, col2, val2, ...)
+// 通常紧跟在 db.Table(users) 之后，并由 .Execute() 终结
+type SetOperation struct {
+	Updates   []Expression // ObjectLiteralExpression 列表（每行一个对象的更新）
+	Condition Expression   // 关联的 WHERE 条件（由 buildQueryBuilder 填充）
+}
+
+func (s *SetOperation) String() string {
+	ups := make([]string, len(s.Updates))
+	for i, u := range s.Updates {
+		ups[i] = u.String()
+	}
+	return fmt.Sprintf("Set([%s])", fmt.Sprintf("%v", ups))
+}
+
+func (s *SetOperation) operationNode() {}
+
+// ObjectLiteralExpression 对象字面量 {key: value, ...}
+// 用于 Insert 和 Set 操作的行/更新定义
+type ObjectLiteralExpression struct {
+	Fields []ObjectField
+}
+
+// ObjectField 对象字面量的字段
+type ObjectField struct {
+	Key   Expression
+	Value Expression
+}
+
+func (o *ObjectLiteralExpression) String() string {
+	parts := make([]string, len(o.Fields))
+	for i, f := range o.Fields {
+		parts[i] = fmt.Sprintf("%s: %s", f.Key, f.Value)
+	}
+	return fmt.Sprintf("{%s}", strings.Join(parts, ", "))
+}
+
+func (o *ObjectLiteralExpression) expressionNode() {}
+
+// ExecuteOperation 终结操作
+// 语法: .Execute() 表示 DML 语句的终结
+type ExecuteOperation struct {
+	// 标记这是一个终结点
+	Terminator bool
+}
+
+func (e *ExecuteOperation) String() string {
+	return "Execute()"
+}
+
+func (e *ExecuteOperation) operationNode() {}
+
+// ===== DDL Operations =====
+
+// CreateTableOperation CREATE TABLE 操作
+// 语法: db.Table(users).Create(id INTEGER, name TEXT, age INTEGER).Execute()
+type CreateTableOperation struct {
+	Table  Expression // 表名
+	Columns []ColumnDef
+}
+
+func (c *CreateTableOperation) String() string {
+	cols := make([]string, len(c.Columns))
+	for idx, col := range c.Columns {
+		cols[idx] = col.String()
+	}
+	return fmt.Sprintf("CreateTable(%s, [%s])", c.Table, fmt.Sprintf("%v", cols))
+}
+
+func (c *CreateTableOperation) operationNode() {}
+func (c *CreateTableOperation) ddlNode()      {}
+
+// DropTableOperation DROP TABLE 操作
+// 语法: db.Table(users).Drop().Execute()
+type DropTableOperation struct {
+	Table Expression // 表名
+}
+
+func (d *DropTableOperation) String() string {
+	return fmt.Sprintf("DropTable(%s)", d.Table)
+}
+
+func (d *DropTableOperation) operationNode() {}
+func (d *DropTableOperation) ddlNode()      {}
+
+// ColumnDef 列定义（用于 CREATE TABLE）
+type ColumnDef struct {
+	Name     string
+	Type     string
+	Nullable bool
+	Primary  bool
+}
+
+func (c *ColumnDef) String() string {
+	s := c.Name + " " + c.Type
+	if c.Primary {
+		s += " PRIMARY KEY"
+	}
+	if !c.Nullable {
+		s += " NOT NULL"
+	}
+	return s
+}
+
+// ===== Aggregations =====
 type AggregateOperation struct {
 	Function string
 	Column   Expression

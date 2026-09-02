@@ -65,6 +65,8 @@ const (
 	TOKEN_RPAREN
 	TOKEN_LBRACKET
 	TOKEN_RBRACKET
+	TOKEN_LBRACE
+	TOKEN_RBRACE
 	TOKEN_COMMA
 	TOKEN_DOT
 	TOKEN_SEMICOLON
@@ -103,6 +105,24 @@ const (
 	TOKEN_EXCEPT
 	TOKEN_AS
 	TOKEN_SUBQUERY
+
+	// DML/DDL 关键字
+	TOKEN_INSERT
+	TOKEN_UPDATE
+	TOKEN_DELETE
+	TOKEN_SET
+	TOKEN_INTO
+	TOKEN_VALUES
+	TOKEN_EXECUTE
+	TOKEN_CREATE
+	TOKEN_DROP
+	TOKEN_PRIMARY
+	TOKEN_KEY
+	TOKEN_DEFAULT
+	TOKEN_INTEGER_TYPE
+	TOKEN_TEXT_TYPE
+	TOKEN_REAL_TYPE
+	TOKEN_BLOB_TYPE
 )
 
 var tokenNames = map[TokenType]string{
@@ -137,6 +157,8 @@ var tokenNames = map[TokenType]string{
 	TOKEN_RPAREN:    ")",
 	TOKEN_LBRACKET:  "[",
 	TOKEN_RBRACKET:  "]",
+	TOKEN_LBRACE:    "{",
+	TOKEN_RBRACE:    "}",
 	TOKEN_COMMA:     ",",
 	TOKEN_DOT:       ".",
 	TOKEN_SEMICOLON: ";",
@@ -173,6 +195,22 @@ var tokenNames = map[TokenType]string{
 	TOKEN_EXCEPT:    "EXCEPT",
 	TOKEN_AS:       "AS",
 	TOKEN_SUBQUERY: "SUBQUERY",
+	TOKEN_INSERT:   "INSERT",
+	TOKEN_UPDATE:   "UPDATE",
+	TOKEN_DELETE:   "DELETE",
+	TOKEN_SET:      "SET",
+	TOKEN_INTO:     "INTO",
+	TOKEN_VALUES:   "VALUES",
+	TOKEN_EXECUTE:  "EXECUTE",
+	TOKEN_CREATE:   "CREATE",
+	TOKEN_DROP:     "DROP",
+	TOKEN_PRIMARY:  "PRIMARY",
+	TOKEN_KEY:      "KEY",
+	TOKEN_DEFAULT:  "DEFAULT",
+	TOKEN_INTEGER_TYPE: "INTEGER_TYPE",
+	TOKEN_TEXT_TYPE:    "TEXT_TYPE",
+	TOKEN_REAL_TYPE:    "REAL_TYPE",
+	TOKEN_BLOB_TYPE:    "BLOB_TYPE",
 }
 
 func (tt TokenType) String() string {
@@ -224,6 +262,22 @@ var keywords = map[string]TokenType{
 	"Except":      TOKEN_EXCEPT,
 	"AS":          TOKEN_AS,
 	"Subquery":    TOKEN_SUBQUERY,
+	"Insert":      TOKEN_INSERT,
+	"Update":      TOKEN_UPDATE,
+	"Delete":      TOKEN_DELETE,
+	"Set":         TOKEN_SET,
+	"Into":        TOKEN_INTO,
+	"Values":      TOKEN_VALUES,
+	"Execute":     TOKEN_EXECUTE,
+	"Create":      TOKEN_CREATE,
+	"Drop":        TOKEN_DROP,
+	"PRIMARY":     TOKEN_PRIMARY,
+	"KEY":         TOKEN_KEY,
+	"Default":     TOKEN_DEFAULT,
+	"INTEGER":     TOKEN_INTEGER_TYPE,
+	"TEXT":        TOKEN_TEXT_TYPE,
+	"REAL":        TOKEN_REAL_TYPE,
+	"BLOB":        TOKEN_BLOB_TYPE,
 }
 
 func LookupIdentifier(ident string) TokenType {

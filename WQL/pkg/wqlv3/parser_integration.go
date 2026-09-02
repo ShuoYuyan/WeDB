@@ -25,6 +25,11 @@ import (
 //   db.Table(orders).Select(city, Count() AS cnt).GroupBy(city).All()
 //   db.Table(orders).Where(amount > 100).Sum(amount)
 //   db.Table(users).Take(10).OrderBy(age, DESC)
+//   db.Table(users).Insert({id: 1, name: "alice"}).Execute()
+//   db.Table(users).Set(age, 31).Where(id = 1).Execute()
+//   db.Table(users).Where(age < 18).Delete().Execute()
+//   db.Table(products).Create(id INTEGER PRIMARY KEY, name TEXT).Execute()
+//   db.Table(temp).Drop().Execute()
 //
 // 注意：
 //   - 标识符（表名、列名）不需要引号：db.Table(users) 而不是 db.Table("users")
@@ -45,14 +50,14 @@ func EvaluateQueryNoQuotes(db *Database, expr string) (QueryResult, error) {
 		return result, fmt.Errorf("parse error: %w", err)
 	}
 
-	// 3. 构造查询构建器
+	// 3. 构造查询构建器（DML/DDL 副作用延后到 executeQuery 中执行）
 	qb, err := buildQueryBuilder(db, query)
 	if err != nil {
 		return result, err
 	}
 
-	// 4. 执行（没有终结操作时默认 All）
-	result, err = executeQuery(qb, query.Operations)
+	// 4. 执行（DML/DDL 在这里完成；SELECT 在这里返回结果）
+	result, err = executeQuery(db, qb, query.Operations)
 	if err != nil {
 		return result, err
 	}
@@ -62,13 +67,16 @@ func EvaluateQueryNoQuotes(db *Database, expr string) (QueryResult, error) {
 }
 
 // buildQueryBuilder 从解析后的 query 构造 wqlv3 QueryBuilder
+// SELECT 查询走 qb；DML/DDL 副作用延后到 executeQuery 中执行
 func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, error) {
 	if query.Source == "" {
 		return nil, fmt.Errorf("no source table")
 	}
 	qb := db.Table(query.Source)
 
-	// 遍历操作链，构建 QueryBuilder
+	// 保存最近一次的 WHERE（供 Delete / Update 使用）
+	var lastWhereExpr parser.Expression
+
 	for _, op := range query.Operations {
 		switch o := op.(type) {
 		case *parser.SelectOperation:
@@ -78,6 +86,7 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 			}
 			qb = qb.Select(cols...)
 		case *parser.WhereOperation:
+			lastWhereExpr = o.Condition
 			where := exprToString(o.Condition)
 			qb = qb.Where(where)
 		case *parser.OrderByOperation:
@@ -105,6 +114,22 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 				return nil, err
 			}
 			qb = qb.Take(n)
+		case *parser.InsertOperation:
+			// 延后到 executeQuery 中执行；表名从 query.Source 取得
+		case *parser.SetOperation:
+			// 延后到 executeQuery 中执行；记录 Set 之后的最近一个 Where 作为条件
+			cond := findWhereAfter(query.Operations, o)
+			if cond == nil {
+				cond = lastWhereExpr // 兜底：使用之前的 Where
+			}
+			o.Condition = cond
+		case *parser.DeleteOperation:
+			// 延后到 executeQuery 中执行；记录条件
+			o.Condition = lastWhereExpr
+		case *parser.CreateTableOperation, *parser.DropTableOperation:
+			// 延后到 executeQuery 中执行
+		case *parser.ExecuteOperation:
+			// 终结符，executeQuery 中处理
 		// GroupBy, Having, Join: 暂不支持（需要更复杂的查询计划器）
 		default:
 			// 忽略不支持的操作
@@ -114,11 +139,148 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 	return qb, nil
 }
 
+// objectLiteralToMap 将对象字面量 AST 转为 map
+func objectLiteralToMap(obj *parser.ObjectLiteralExpression) map[string]interface{} {
+	out := map[string]interface{}{}
+	for _, f := range obj.Fields {
+		key := strings.TrimSpace(exprToString(f.Key))
+		// key 不应该有引号
+		key = strings.Trim(key, `"`)
+		out[key] = literalValue(f.Value)
+	}
+	return out
+}
+
+// literalValue 取字面量表达式的 Go 原生值
+// 数字字符串自动转为 int64/float64，布尔转为 bool
+func literalValue(e parser.Expression) interface{} {
+	switch v := e.(type) {
+	case *parser.LiteralExpression:
+		if s, ok := v.Value.(string); ok {
+			// 数字字面量在 lexer 中是字符串形式，转为原生类型
+			if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return i
+			}
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				return f
+			}
+			if s == "true" {
+				return true
+			}
+			if s == "false" {
+				return false
+			}
+			if s == "null" {
+				return nil
+			}
+			return s
+		}
+		return v.Value
+	case *parser.Identifier:
+		return v.Value
+	}
+	return exprToString(e)
+}
+
 // executeQuery 执行查询并返回结果
-func executeQuery(qb *QueryBuilder, ops []parser.Operation) (QueryResult, error) {
+// 处理顺序：先收集所有 DML/DDL 操作，最后按顺序执行；
+// 然后处理 SELECT 终结符（All/First）。
+func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (QueryResult, error) {
 	result := QueryResult{Rows: nil}
 
-	// 找到最后的终结操作
+	// 检查是否包含 DML/DDL 操作
+	hasDML := false
+	for _, op := range ops {
+		switch op.(type) {
+		case *parser.InsertOperation, *parser.SetOperation, *parser.DeleteOperation,
+			*parser.CreateTableOperation, *parser.DropTableOperation:
+			hasDML = true
+		}
+	}
+
+	// 如果有 DML/DDL，先执行（顺序与解析顺序一致）
+	if hasDML {
+		for _, op := range ops {
+			switch o := op.(type) {
+			case *parser.InsertOperation:
+				rows := make([]map[string]interface{}, 0, len(o.Rows))
+				for _, r := range o.Rows {
+					if obj, ok := r.(*parser.ObjectLiteralExpression); ok {
+						rows = append(rows, objectLiteralToMap(obj))
+					}
+				}
+				n, err := db.Insert(qb.tableName).Values(rows...).Execute()
+				if err != nil {
+					return result, err
+				}
+				result.AffectedRows = n
+			case *parser.SetOperation:
+				updates := map[string]interface{}{}
+				for _, u := range o.Updates {
+					if obj, ok := u.(*parser.ObjectLiteralExpression); ok {
+						for k, v := range objectLiteralToMap(obj) {
+							updates[k] = v
+						}
+					}
+				}
+				ub := db.Update(qb.tableName).Sets(updates)
+				if o.Condition != nil {
+					ub.Where(exprToString(o.Condition))
+				}
+				n, err := ub.Execute()
+				if err != nil {
+					return result, err
+				}
+				result.AffectedRows = n
+			case *parser.DeleteOperation:
+				dbDel := db.Delete(qb.tableName)
+				if o.Condition != nil {
+					dbDel.Where(exprToString(o.Condition))
+				}
+				n, err := dbDel.Execute()
+				if err != nil {
+					return result, err
+				}
+				result.AffectedRows = n
+			case *parser.CreateTableOperation:
+				cols := make([]*ColumnDef, 0, len(o.Columns))
+				for _, col := range o.Columns {
+					cols = append(cols, NewColumn(col.Name, col.Type, col.Nullable))
+				}
+				if err := db.CreateTable(NewTableSchema(qb.tableName, cols...)); err != nil {
+					return result, err
+				}
+			case *parser.DropTableOperation:
+				if err := db.DropTable(qb.tableName); err != nil {
+					return result, err
+				}
+			}
+		}
+
+		// DML/DDL 后，如果最后一个操作是 Execute() 或只有 DML/DDL，返回空结果
+		lastOp := ops[len(ops)-1]
+		if _, isExec := lastOp.(*parser.ExecuteOperation); isExec {
+			result.Rows = []map[string]interface{}{}
+			return result, nil
+		}
+		// 如果没有 Execute 但都是 DML，也返回空
+		allDML := true
+		for _, op := range ops {
+			switch op.(type) {
+			case *parser.AllOperation, *parser.FirstOperation,
+				*parser.SelectOperation, *parser.WhereOperation, *parser.OrderByOperation,
+				*parser.TakeOperation, *parser.SkipOperation, *parser.LimitOperation,
+				*parser.GroupByOperation, *parser.HavingOperation, *parser.JoinOperation:
+				allDML = false
+			}
+		}
+		if allDML {
+			result.Rows = []map[string]interface{}{}
+			return result, nil
+		}
+	}
+
+	// SELECT 终结符
 	for i := len(ops) - 1; i >= 0; i-- {
 		op := ops[i]
 		switch op.(type) {
@@ -148,6 +310,23 @@ func executeQuery(qb *QueryBuilder, ops []parser.Operation) (QueryResult, error)
 	}
 	result.Rows = rows
 	return result, nil
+}
+
+// findWhereAfter 查找 ops 中 target 之后最近的一个 WhereOperation
+func findWhereAfter(ops []parser.Operation, target parser.Operation) parser.Expression {
+	found := false
+	for _, op := range ops {
+		if !found {
+			if op == target {
+				found = true
+			}
+			continue
+		}
+		if w, ok := op.(*parser.WhereOperation); ok {
+			return w.Condition
+		}
+	}
+	return nil
 }
 
 // exprToString 将 Expression 转为 WQL 字符串（无双引号设计）
