@@ -15,6 +15,7 @@ package wqlv3
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -274,6 +275,15 @@ func (d *Database) DropTable(tableName string) error {
 	return d.adapter.DropTable(tableName)
 }
 
+// JoinSpec 内部 JOIN 规格
+type JoinSpec struct {
+	Type       string                 // "Join" / "LeftJoin" / "RightJoin"
+	Table      string                 // 被连接的表名
+	LeftKey    string                 // 旧语法: 左表键
+	RightKey   string                 // 旧语法: 右表键
+	OnExpr     string                 // ON 条件字符串（已格式化）
+}
+
 // QueryBuilder 链式查询构建器
 type QueryBuilder struct {
 	db        Adapter
@@ -286,6 +296,7 @@ type QueryBuilder struct {
 	orderDir  string // "ASC" 或 "DESC"
 	skipN     int64
 	takeN     int64
+	joins     []JoinSpec // JOIN 链
 }
 
 // Select 指定要查询的列
@@ -317,6 +328,21 @@ func (qb *QueryBuilder) Skip(n int64) *QueryBuilder {
 // Take 设置最大返回行数
 func (qb *QueryBuilder) Take(n int64) *QueryBuilder {
 	qb.takeN = n
+	return qb
+}
+
+// Join 链式添加 JOIN
+// joinType: "Join" (INNER) / "LeftJoin" / "RightJoin"
+// 旧语法: Join(orders, users.id, orders.user_id)
+// 新语法: Join(orders, ON users.id = orders.user_id)
+func (qb *QueryBuilder) Join(joinType, table, leftKey, rightKey, onExpr string) *QueryBuilder {
+	qb.joins = append(qb.joins, JoinSpec{
+		Type:     joinType,
+		Table:    table,
+		LeftKey:  leftKey,
+		RightKey: rightKey,
+		OnExpr:   onExpr,
+	})
 	return qb
 }
 
@@ -365,23 +391,37 @@ func (qb *QueryBuilder) Max(col string) (interface{}, error) {
 
 // execute 实际执行查询
 func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
-	// 第1步: 扫描表
-	rows, err := qb.db.ScanTableWithColumns(qb.tableName, qb.selects)
+	// 第1步: 扫描主表（无列过滤，先取全量）
+	rows, err := qb.db.ScanTable(qb.tableName)
 	if err != nil {
 		return nil, fmt.Errorf("scan table %s: %w", qb.tableName, err)
 	}
 
-	// 第2步: WHERE 过滤（在内存中）
+	// 第2步: 依次应用 JOIN（嵌套循环）
+	for _, j := range qb.joins {
+		rightRows, err := qb.db.ScanTable(j.Table)
+		if err != nil {
+			return nil, fmt.Errorf("scan join table %s: %w", j.Table, err)
+		}
+		rows = joinRows(rows, rightRows, j)
+	}
+
+	// 第3步: WHERE 过滤（在内存中）
 	if qb.where != "" {
 		rows = filterRows(rows, qb.where)
 	}
 
-	// 第3步: ORDER BY 排序
+	// 第4步: SELECT 列投影（最后一步）
+	if len(qb.selects) > 0 {
+		rows = projectColumns(rows, qb.selects)
+	}
+
+	// 第5步: ORDER BY 排序
 	if qb.orderCol != "" {
 		rows = sortRows(rows, qb.orderCol, qb.orderDir)
 	}
 
-	// 第4步: SKIP / TAKE
+	// 第6步: SKIP / TAKE
 	if qb.skipN > 0 || qb.takeN > 0 {
 		start := int(qb.skipN)
 		if start > len(rows) {
@@ -395,6 +435,159 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 	}
 
 	return rows, nil
+}
+
+// projectColumns 投影出指定列（若列不存在则填 nil）
+func projectColumns(rows []map[string]interface{}, cols []string) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		proj := make(map[string]interface{}, len(cols))
+		for _, c := range cols {
+			// 先按完整名找；找不到则按短名（去表前缀）找
+			if v, ok := row[c]; ok {
+				proj[c] = v
+				continue
+			}
+			if idx := strings.LastIndex(c, "."); idx >= 0 {
+				short := c[idx+1:]
+				if v, ok := row[short]; ok {
+					proj[c] = v
+					continue
+				}
+			}
+			proj[c] = nil
+		}
+		out = append(out, proj)
+	}
+	return out
+}
+
+// joinRows 嵌套循环连接。
+// 返回的每行是 left+right 字段合并后的新行。
+// 冲突策略：右表字段加表名前缀以避免覆盖；左表字段保持原名；
+// 解析时如 ColumnExpr "table.col" 找不到，则退回到 "col" 短名。
+// 行为：
+//   - INNER Join: 仅保留匹配的行
+//   - LeftJoin:   保留所有左行，右表不匹配时右表字段为 nil
+//   - RightJoin:  保留所有右行，左表不匹配时左表字段为 nil
+// 匹配规则：优先使用 OnExpr 解析的布尔表达式（如果非空）；
+// 否则使用 LeftKey/RightKey 单列等值。
+func joinRows(left, right []map[string]interface{}, j JoinSpec) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(left))
+
+	// 预解析 ON 表达式
+	var onParsed Expression
+	if j.OnExpr != "" {
+		if parsed, err := ParseWhere(j.OnExpr); err == nil {
+			onParsed = parsed
+		}
+	}
+
+	leftMatched := make([]bool, len(left))
+	rightMatched := make([]bool, len(right))
+
+	for li, lr := range left {
+		matched := false
+		for ri, rr := range right {
+			var ok bool
+			if onParsed != nil {
+				merged := mergeRows(lr, rr, j.Table)
+				ok = EvalBoolExpr(onParsed, merged)
+			} else {
+				ok = valuesEqual(lr[j.LeftKey], rr[j.RightKey])
+			}
+			if ok {
+				matched = true
+				leftMatched[li] = true
+				rightMatched[ri] = true
+				if onParsed != nil {
+					out = append(out, mergeRows(lr, rr, j.Table))
+				} else {
+					// 旧语法: 简单合并（不冲突）
+					merged := make(map[string]interface{})
+					for k, v := range lr {
+						merged[k] = v
+					}
+					for k, v := range rr {
+						if _, exists := merged[k]; !exists {
+							merged[k] = v
+						}
+					}
+					out = append(out, merged)
+				}
+			}
+		}
+		if !matched && (j.Type == "LeftJoin" || j.Type == "Left Join" || strings.EqualFold(j.Type, "leftjoin")) {
+			out = append(out, mergeRows(lr, nil, j.Table))
+		}
+	}
+
+	// RightJoin: 补上未匹配的右行
+	if strings.EqualFold(strings.ReplaceAll(j.Type, " ", ""), "rightjoin") {
+		for ri, rr := range right {
+			if !rightMatched[ri] {
+				out = append(out, mergeRows(nil, rr, j.Table))
+			}
+		}
+	}
+
+	return out
+}
+
+// mergeRows 合并左右行；nil 表示占位空行
+// 为了支持 ON users.id = orders.user_id，右表的列会带 "table." 前缀
+// 以避免与左表同名列冲突。
+func mergeRows(left, right map[string]interface{}, rightTable string) map[string]interface{} {
+	merged := make(map[string]interface{})
+	for k, v := range left {
+		merged[k] = v
+	}
+	for k, v := range right {
+		if rightTable != "" {
+			prefixed := rightTable + "." + k
+			if _, exists := merged[k]; !exists {
+				merged[k] = v
+			}
+			merged[prefixed] = v
+		} else {
+			merged[k] = v
+		}
+	}
+	return merged
+}
+
+// valuesEqual 比较两个值是否相等（用于单列等值连接）
+func valuesEqual(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	// 类型相同的直接比较
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+	// 数字之间的宽松比较
+	af, aok := toFloat(a)
+	bf, bok := toFloat(b)
+	if aok && bok {
+		return af == bf
+	}
+	return false
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	return 0, false
 }
 
 // filterRows 在内存中应用 WHERE 过滤

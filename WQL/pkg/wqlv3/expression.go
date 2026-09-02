@@ -22,8 +22,16 @@ type ColumnExpr struct {
 }
 
 func (e *ColumnExpr) Evaluate(row map[string]interface{}) (interface{}, error) {
+	// 先尝试完整名（含 table.column 形式）
 	if v, ok := row[e.Name]; ok {
 		return v, nil
+	}
+	// 退而求其次：取最后一段（去表前缀），便于 JOIN 合并行查找
+	if idx := strings.LastIndex(e.Name, "."); idx >= 0 {
+		short := e.Name[idx+1:]
+		if v, ok := row[short]; ok {
+			return v, nil
+		}
 	}
 	return nil, nil
 }
@@ -263,6 +271,13 @@ func isIdentifier(s string) bool {
 		return false
 	}
 	for i, c := range s {
+		if c == '.' {
+			// 允许带点的复合标识符（如 users.id）
+			if i == 0 || i == len(s)-1 {
+				return false
+			}
+			continue
+		}
 		if i == 0 && (c >= '0' && c <= '9') {
 			return false // 不能以数字开头
 		}

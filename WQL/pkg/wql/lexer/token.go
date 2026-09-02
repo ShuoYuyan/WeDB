@@ -83,6 +83,7 @@ const (
 	TOKEN_JOIN
 	TOKEN_LEFT_JOIN
 	TOKEN_RIGHT_JOIN
+	TOKEN_ON
 	TOKEN_LIMIT
 	TOKEN_TAKE
 	TOKEN_SKIP
@@ -173,6 +174,7 @@ var tokenNames = map[TokenType]string{
 	TOKEN_JOIN:      "JOIN",
 	TOKEN_LEFT_JOIN: "LEFT_JOIN",
 	TOKEN_RIGHT_JOIN:"RIGHT_JOIN",
+	TOKEN_ON:        "ON",
 	TOKEN_LIMIT:     "LIMIT",
 	TOKEN_TAKE:      "TAKE",
 	TOKEN_SKIP:      "SKIP",
@@ -230,6 +232,7 @@ var keywords = map[string]TokenType{
 	"Join":       TOKEN_JOIN,
 	"LeftJoin":   TOKEN_LEFT_JOIN,
 	"RightJoin":  TOKEN_RIGHT_JOIN,
+	"ON":         TOKEN_ON,
 	"Limit":      TOKEN_LIMIT,
 	"Take":       TOKEN_TAKE,
 	"Skip":       TOKEN_SKIP,

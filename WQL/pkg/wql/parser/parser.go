@@ -206,56 +206,79 @@ func (p *Parser) parseWhereOperation() (*WhereOperation, error) {
 }
 
 // parseJoinOperation 解析JOIN操作
+// 语法:
+//   .Join(otherTable)                                       -- 笛卡尔积
+//   .Join(otherTable, leftCol, rightCol)                    -- 单列等值连接 (兼容旧语法)
+//   .Join(otherTable, ON left.col = right.col)              -- ON 条件
+//   .Join(otherTable, ON left.col = right.col AND l2 = r2)  -- 复合 ON 条件
 func (p *Parser) parseJoinOperation() (*JoinOperation, error) {
 	joinType := p.currentToken.Value
 
 	p.nextToken()
 
 	if p.currentToken.Type != lexer.TOKEN_LPAREN {
-		return nil, fmt.Errorf("expected '(', got %s", p.currentToken.Type)
+		return nil, fmt.Errorf("expected '(' after %s, got %s", joinType, p.currentToken.Type)
 	}
-
 	p.nextToken()
 
+	// 第一个参数：表名（必须为标识符）
 	table, err := p.parseExpression()
 	if err != nil {
 		return nil, err
 	}
 
-	if p.currentToken.Type != lexer.TOKEN_COMMA {
-		return nil, fmt.Errorf("expected ',', got %s", p.currentToken.Type)
-	}
+	join := &JoinOperation{JoinType: joinType, Table: table}
 
+	// 检查是否有更多参数
+	if p.currentToken.Type != lexer.TOKEN_COMMA {
+		if p.currentToken.Type != lexer.TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ',' or ')' in Join, got %s", p.currentToken.Type)
+		}
+		p.nextToken()
+		return join, nil
+	}
 	p.nextToken()
 
+	// 探测 ON 关键字
+	if p.currentToken.Type == lexer.TOKEN_ON {
+		p.nextToken()
+		// 解析 ON 后的整个表达式
+		cond, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		join.Condition = cond
+		if p.currentToken.Type != lexer.TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ')' after Join ON, got %s", p.currentToken.Type)
+		}
+		p.nextToken()
+		return join, nil
+	}
+
+	// 兼容旧语法：Join(t, leftKey, rightKey)
 	leftKey, err := p.parseExpression()
 	if err != nil {
 		return nil, err
 	}
+	join.LeftKey = leftKey
 
 	if p.currentToken.Type != lexer.TOKEN_COMMA {
-		return nil, fmt.Errorf("expected ',', got %s", p.currentToken.Type)
+		return nil, fmt.Errorf("expected ',' in Join (leftKey, rightKey), got %s", p.currentToken.Type)
 	}
-
 	p.nextToken()
 
 	rightKey, err := p.parseExpression()
 	if err != nil {
 		return nil, err
 	}
+	join.RightKey = rightKey
 
 	if p.currentToken.Type != lexer.TOKEN_RPAREN {
-		return nil, fmt.Errorf("expected ')', got %s", p.currentToken.Type)
+		return nil, fmt.Errorf("expected ')' to close Join, got %s", p.currentToken.Type)
 	}
-
 	p.nextToken()
 
-	return &JoinOperation{
-		JoinType: joinType,
-		Table:    table,
-		LeftKey:  leftKey,
-		RightKey: rightKey,
-	}, nil
+	return join, nil
 }
 
 // parseOrderByOperation 解析ORDER BY操作

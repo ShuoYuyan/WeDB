@@ -114,6 +114,21 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 				return nil, err
 			}
 			qb = qb.Take(n)
+		case *parser.JoinOperation:
+			joinType := o.JoinType
+			tableName := exprToString(o.Table)
+			var onExpr string
+			if o.Condition != nil {
+				onExpr = exprToString(o.Condition)
+			}
+			var leftKey, rightKey string
+			if o.LeftKey != nil {
+				leftKey = exprToString(o.LeftKey)
+			}
+			if o.RightKey != nil {
+				rightKey = exprToString(o.RightKey)
+			}
+			qb = qb.Join(joinType, tableName, leftKey, rightKey, onExpr)
 		case *parser.InsertOperation:
 			// 延后到 executeQuery 中执行；表名从 query.Source 取得
 		case *parser.SetOperation:
