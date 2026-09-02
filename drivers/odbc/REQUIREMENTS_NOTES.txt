@@ -1,0 +1,56 @@
+I've implemented the key fixes to address the issues identified in STATUS.md:
+
+Fixed Issues:
+
+1. File Lock Problem
+
+  • Modified e2e.ps1 to stop any running odbc_e2e.exe processes before copying/removing the DLL
+  • Added Get-Process | Where-Object { $_.ProcessName -eq "odbc_e2e" } | Stop-Process -Force with a 500ms delay
+
+2. Missing SQLGetInfo Attributes
+
+  • Added critical ODBC Manager compatibility attributes to api_meta_info.go:
+    • Cursor behavior: SQLInfoCursorCommitBehavior and SQLInfoCursorRollbackBehavior (SQL_CB_DELETE)
+    • Accessibility: SQLInfoAccessibleTables and SQLInfoAccessibleProcedures
+    • Limits: Max tables in select, max columns in select/table/orderby/groupby, max procedure/cursor name lengths
+    • Capabilities: Bookmarks, ResultSets, SqlServer, Integrity
+    • Procedure term: Added SQLInfoProcedureTerm mapping
+
+3. ODBC Tracing
+
+  • Enabled ODBC tracing in e2e.ps1 by adding registry entries:
+    • HKLM\SOFTWARE\ODBC\ODBC.INI\ODBC\Trace = 1
+    • HKLM\SOFTWARE\ODBC\ODBC.INI\ODBC\TraceFile = C:\temp\odbctrace.log
+  • Creates C:\temp directory if needed
+  • Automatically disables tracing after test completion
+
+4. Enhanced Debug Logging
+
+  • Improved SQLAllocHandle in api_core.go with detailed debug output:
+    • Logs initial call with handle type, input handle, and output pointer
+    • Tracks handle allocation for ENV, DBC, and STMT types
+    • Reports any lookup failures with specific error messages
+    • Uses unique variable names to avoid Go variable shadowing
+
+Regarding the RegSvr32 Error:
+
+The RegSvr32 error you saw is expected and not a problem. ODBC drivers don't use COM registration - they're registered
+through the registry (HKLM\SOFTWARE\ODBC\ODBCINST.INI), which our e2e.ps1 script handles correctly.
+
+Next Steps:
+
+The Go build commands are currently failing in the test environment. To apply these fixes, you'll need to:
+
+  1. Rebuild the DLL with the updated code:
+
+cd C:\Users\HP\Documents\WeDB\drivers\odbc
+powershell -ExecutionPolicy Bypass -File build.ps1
+
+  2. Run the E2E test:
+
+cd C:\Users\HP\Documents\WeDB\drivers\odbc\test
+powershell -ExecutionPolicy Bypass -File e2e.ps1
+
+  3. Check the ODBC trace log at C:\temp\odbctrace.log to see what the ODBC Manager is actually calling
+
+The enhanced SQLGetInfo attributes should resolve the IM001 error by providing the ODBC Manager with the information it needs to properly dispatch SQLAllocHandle for statement handles.
