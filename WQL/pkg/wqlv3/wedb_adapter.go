@@ -54,6 +54,33 @@ func (w *WeDBAdapter) ScanTableWithColumns(tableName string, columns []string) (
 	return out, nil
 }
 
+// ScanTableWithOptions 把 WHERE/ORDER BY/LIMIT/OFFSET 下推到 WeDB 存储引擎
+func (w *WeDBAdapter) ScanTableWithOptions(tableName string, opts *QueryOptions) ([]map[string]interface{}, error) {
+	if w.db == nil {
+		return nil, fmt.Errorf("database not opened")
+	}
+	apiOpts := &api.QueryOptions{
+		Columns: opts.Columns,
+		Where:   opts.Where,
+		Limit:   opts.Limit,
+		Offset:  opts.Offset,
+	}
+	for _, ob := range opts.OrderBy {
+		// 解析 "col [ASC|DESC]" 形式
+		parts := strings.Fields(ob)
+		if len(parts) == 0 {
+			continue
+		}
+		col := parts[0]
+		order := api.SortAsc
+		if len(parts) > 1 && strings.EqualFold(parts[1], "DESC") {
+			order = api.SortDesc
+		}
+		apiOpts.OrderBy = append(apiOpts.OrderBy, api.SortBy{Column: col, Order: order})
+	}
+	return w.db.ScanTableWithOptions(tableName, apiOpts)
+}
+
 // CreateTable 创建表
 func (w *WeDBAdapter) CreateTable(schema *TableSchema) error {
 	if w.db == nil {

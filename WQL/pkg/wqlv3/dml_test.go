@@ -1,6 +1,7 @@
 package wqlv3
 
 import (
+	"strings"
 	"sync"
 	"testing"
 )
@@ -11,6 +12,9 @@ type mockAdapter struct {
 	mu        sync.Mutex
 	tables    map[string][]map[string]interface{}
 	autoID    map[string]int64
+
+	// pushdownHits 记录 ScanTableWithOptions 的下推命中次数
+	pushdownHits int
 }
 
 func newMockAdapter() *mockAdapter {
@@ -57,6 +61,60 @@ func (m *mockAdapter) ScanTableWithColumns(tableName string, columns []string) (
 		out = append(out, filtered)
 	}
 	return out, nil
+}
+
+// ScanTableWithOptions 模拟下推：直接解析 WHERE 后在内存中过滤。
+// 命中时 pushdownHits++。
+func (m *mockAdapter) ScanTableWithOptions(tableName string, opts *QueryOptions) ([]map[string]interface{}, error) {
+	m.mu.Lock()
+	m.pushdownHits++
+	m.mu.Unlock()
+
+	rows, err := m.ScanTable(tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// WHERE
+	if opts != nil && opts.Where != "" {
+		rows = filterRows(rows, opts.Where)
+	}
+	// ORDER BY
+	if opts != nil && len(opts.OrderBy) > 0 {
+		for _, ob := range opts.OrderBy {
+			// 简单解析 "col" / "col ASC" / "col DESC"
+			parts := strings.Fields(ob)
+			col := parts[0]
+			dir := "ASC"
+			if len(parts) > 1 && strings.EqualFold(parts[1], "DESC") {
+				dir = "DESC"
+			}
+			rows = sortRows(rows, col, dir)
+		}
+	}
+	// OFFSET
+	if opts != nil && opts.Offset > 0 && opts.Offset < len(rows) {
+		rows = rows[opts.Offset:]
+	}
+	// LIMIT
+	if opts != nil && opts.Limit > 0 && opts.Limit < len(rows) {
+		rows = rows[:opts.Limit]
+	}
+	// Columns
+	if opts != nil && len(opts.Columns) > 0 {
+		out := make([]map[string]interface{}, 0, len(rows))
+		for _, row := range rows {
+			filtered := make(map[string]interface{})
+			for _, c := range opts.Columns {
+				if v, ok := row[c]; ok {
+					filtered[c] = v
+				}
+			}
+			out = append(out, filtered)
+		}
+		return out, nil
+	}
+	return rows, nil
 }
 
 func (m *mockAdapter) ListTables() []string {

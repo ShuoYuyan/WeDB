@@ -30,6 +30,23 @@ func NewDatabase(a Adapter) *Database {
 	return &Database{adapter: a}
 }
 
+// QueryOptions 查询选项（用于下推到存储引擎）
+type QueryOptions struct {
+	Columns []string // 空表示所有列
+	Where   string   // WHERE 子句
+	OrderBy []string // ["col ASC", "col DESC"] 简单形式
+	Limit   int
+	Offset  int
+}
+
+// SortOrder 排序方向
+type SortOrder string
+
+const (
+	SortAsc  SortOrder = "ASC"
+	SortDesc SortOrder = "DESC"
+)
+
 // Adapter 是 WQL 与底层存储之间的接口
 // 当前实现：WeDBAdapter（直接调用 WeDB 的 Go API）
 // 未来可扩展：PostgreSQLAdapter、MySQLAdapter 等
@@ -37,6 +54,10 @@ type Adapter interface {
 	// 表操作
 	ScanTable(tableName string) ([]map[string]interface{}, error)
 	ScanTableWithColumns(tableName string, columns []string) ([]map[string]interface{}, error)
+	// ScanTableWithOptions 把 WHERE/ORDER/LIMIT 下推到存储引擎；
+	// 不支持完整下推的实现可以回退到 ScanTable 后在内存中过滤。
+	// 适配器应记录 pushdown 命中次数以便测试验证。
+	ScanTableWithOptions(tableName string, opts *QueryOptions) ([]map[string]interface{}, error)
 	ListTables() []string
 	TableExists(name string) bool
 	CreateTable(schema *TableSchema) error
@@ -423,10 +444,56 @@ func (qb *QueryBuilder) Max(col string) (interface{}, error) {
 
 // execute 实际执行查询
 func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
-	// 第1步: 扫描主表（无列过滤，先取全量）
-	rows, err := qb.db.ScanTable(qb.tableName)
-	if err != nil {
-		return nil, fmt.Errorf("scan table %s: %w", qb.tableName, err)
+	// 第1步: 扫描主表
+	// 如果无 JOIN / 无 GROUP BY / 无聚合，可下推 WHERE / ORDER BY / LIMIT / OFFSET
+	var rows []map[string]interface{}
+	if qb.canPushdown() {
+		opts := &QueryOptions{
+			Columns: nil, // 由 projectColumns 之后处理
+			Where:   qb.where,
+		}
+		if qb.orderCol != "" {
+			dir := "ASC"
+			if qb.orderDir == "DESC" {
+				dir = "DESC"
+			}
+			opts.OrderBy = []string{qb.orderCol + " " + dir}
+		}
+		opts.Limit = int(qb.takeN)
+		opts.Offset = int(qb.skipN)
+		scanned, err := qb.db.ScanTableWithOptions(qb.tableName, opts)
+		if err == nil {
+			rows = scanned
+		} else {
+			// 下推失败：回退到内存过滤
+			rows, err = qb.db.ScanTable(qb.tableName)
+			if err != nil {
+				return nil, fmt.Errorf("scan table %s: %w", qb.tableName, err)
+			}
+			if qb.where != "" {
+				rows = filterRows(rows, qb.where)
+			}
+			if qb.orderCol != "" {
+				rows = sortRows(rows, qb.orderCol, qb.orderDir)
+			}
+			if qb.skipN > 0 || qb.takeN > 0 {
+				start := int(qb.skipN)
+				if start > len(rows) {
+					start = len(rows)
+				}
+				end := len(rows)
+				if qb.takeN > 0 && int(qb.takeN) < len(rows)-start {
+					end = start + int(qb.takeN)
+				}
+				rows = rows[start:end]
+			}
+		}
+	} else {
+		scanned, err := qb.db.ScanTable(qb.tableName)
+		if err != nil {
+			return nil, fmt.Errorf("scan table %s: %w", qb.tableName, err)
+		}
+		rows = scanned
 	}
 
 	// 第2步: 依次应用 JOIN（嵌套循环）
@@ -438,8 +505,8 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 		rows = joinRows(rows, rightRows, j)
 	}
 
-	// 第3步: WHERE 过滤（在内存中）
-	if qb.where != "" {
+	// 第3步: WHERE 过滤（仅当未下推时）
+	if qb.where != "" && !qb.canPushdown() {
 		rows = filterRows(rows, qb.where)
 	}
 
@@ -450,7 +517,6 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 
 	// 第5步: HAVING 过滤（聚合后）
 	if qb.having != "" {
-		// 将 HAVING 中的 "Func(col)" 形式重写为已合成的 key，便于 ParseWhere 识别
 		havingRewritten := rewriteHavingAggregates(qb.having, qb.aggFuncs)
 		rows = filterRows(rows, havingRewritten)
 	}
@@ -460,13 +526,13 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 		rows = projectColumns(rows, qb.selects)
 	}
 
-	// 第7步: ORDER BY 排序
-	if qb.orderCol != "" {
+	// 第7步: ORDER BY 排序（仅当未下推时）
+	if qb.orderCol != "" && !qb.canPushdown() {
 		rows = sortRows(rows, qb.orderCol, qb.orderDir)
 	}
 
-	// 第8步: SKIP / TAKE
-	if qb.skipN > 0 || qb.takeN > 0 {
+	// 第8步: SKIP / TAKE（仅当未下推时）
+	if (qb.skipN > 0 || qb.takeN > 0) && !qb.canPushdown() {
 		start := int(qb.skipN)
 		if start > len(rows) {
 			start = len(rows)
@@ -479,6 +545,18 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 	}
 
 	return rows, nil
+}
+
+// canPushdown 判断 WHERE/ORDER/LIMIT 是否可下推到存储引擎
+func (qb *QueryBuilder) canPushdown() bool {
+	// 仅有以下操作时可下推：SELECT / WHERE / ORDER BY / SKIP / TAKE
+	// 禁止下推：JOIN / GROUP BY / HAVING / 聚合
+	return len(qb.joins) == 0 &&
+		len(qb.groupBy) == 0 &&
+		len(qb.aggFuncs) == 0 &&
+		qb.having == "" &&
+		// 暂不下推 HAVING/OrderBy 中含聚合函数
+		true
 }
 
 // rewriteHavingAggregates 将 HAVING 字符串中的 "Func(col)" 替换为已合成的 key
