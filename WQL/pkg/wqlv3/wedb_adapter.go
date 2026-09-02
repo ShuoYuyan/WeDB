@@ -99,6 +99,58 @@ func (w *WeDBAdapter) GetTableSchema(name string) (*TableSchema, error) {
 	return w.convertFromAPISchema(apiSchema), nil
 }
 
+// ===== DML 操作 =====
+
+// InsertRow 插入单行
+func (w *WeDBAdapter) InsertRow(tableName string, row map[string]interface{}) error {
+	if w.db == nil {
+		return fmt.Errorf("database not opened")
+	}
+	if !w.TableExists(tableName) {
+		return fmt.Errorf("table not found: %s", tableName)
+	}
+	return w.db.InsertRow(tableName, row)
+}
+
+// InsertRows 批量插入
+func (w *WeDBAdapter) InsertRows(tableName string, rows []map[string]interface{}) error {
+	if w.db == nil {
+		return fmt.Errorf("database not opened")
+	}
+	if !w.TableExists(tableName) {
+		return fmt.Errorf("table not found: %s", tableName)
+	}
+	return w.db.InsertRows(tableName, rows)
+}
+
+// UpdateRow 更新满足条件的行
+func (w *WeDBAdapter) UpdateRow(tableName string, row map[string]interface{}, condition string) error {
+	if w.db == nil {
+		return fmt.Errorf("database not opened")
+	}
+	if !w.TableExists(tableName) {
+		return fmt.Errorf("table not found: %s", tableName)
+	}
+	if condition == "" {
+		return fmt.Errorf("UPDATE without WHERE is not allowed for safety; use UpdateRows for unconditional updates")
+	}
+	return w.db.UpdateRow(tableName, row, condition)
+}
+
+// DeleteRow 删除满足条件的行
+func (w *WeDBAdapter) DeleteRow(tableName string, condition string) error {
+	if w.db == nil {
+		return fmt.Errorf("database not opened")
+	}
+	if !w.TableExists(tableName) {
+		return fmt.Errorf("table not found: %s", tableName)
+	}
+	if condition == "" {
+		return fmt.Errorf("DELETE without WHERE is not allowed for safety")
+	}
+	return w.db.DeleteRow(tableName, condition)
+}
+
 // ===== 聚合操作 =====
 
 // Count 统计行数

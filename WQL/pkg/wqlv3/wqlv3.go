@@ -38,9 +38,17 @@ type Adapter interface {
 	ScanTableWithColumns(tableName string, columns []string) ([]map[string]interface{}, error)
 	ListTables() []string
 	TableExists(name string) bool
+	CreateTable(schema *TableSchema) error
+	DropTable(name string) error
+
+	// 数据操作 (DML)
+	InsertRow(tableName string, row map[string]interface{}) error
+	InsertRows(tableName string, rows []map[string]interface{}) error
+	UpdateRow(tableName string, row map[string]interface{}, condition string) error
+	DeleteRow(tableName string, condition string) error
+	Count(tableName, condition string) (int64, error)
 
 	// 聚合
-	Count(tableName, condition string) (int64, error)
 	Min(tableName, column, condition string) (interface{}, error)
 	Max(tableName, column, condition string) (interface{}, error)
 	Sum(tableName, column, condition string) (float64, error)
@@ -70,6 +78,151 @@ func (d *Database) Ping() error {
 	return nil
 }
 
+// ===== InsertBuilder =====
+
+// InsertBuilder 插入数据构建器
+// 用法: db.Insert("users").Values(row1, row2, ...).Execute()
+type InsertBuilder struct {
+	db        Adapter
+	tableName string
+	rows      []map[string]interface{}
+}
+
+// Values 设置要插入的行（单行或多行）
+func (ib *InsertBuilder) Values(rows ...map[string]interface{}) *InsertBuilder {
+	ib.rows = append(ib.rows, rows...)
+	return ib
+}
+
+// Value 快捷方法：插入单行
+func (ib *InsertBuilder) Value(row map[string]interface{}) *InsertBuilder {
+	return ib.Values(row)
+}
+
+// Execute 执行插入，返回影响行数
+func (ib *InsertBuilder) Execute() (int64, error) {
+	if len(ib.rows) == 0 {
+		return 0, fmt.Errorf("no rows to insert")
+	}
+	if len(ib.rows) == 1 {
+		if err := ib.db.InsertRow(ib.tableName, ib.rows[0]); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	if err := ib.db.InsertRows(ib.tableName, ib.rows); err != nil {
+		return 0, err
+	}
+	return int64(len(ib.rows)), nil
+}
+
+// ===== UpdateBuilder =====
+
+// UpdateBuilder 更新数据构建器
+// 用法: db.Update("users").Set("name", "bob").Where("id = 1").Execute()
+type UpdateBuilder struct {
+	db        Adapter
+	tableName string
+	updates   map[string]interface{}
+	condition string
+}
+
+// Set 设置要更新的列值
+func (ub *UpdateBuilder) Set(column string, value interface{}) *UpdateBuilder {
+	ub.updates[column] = value
+	return ub
+}
+
+// Sets 批量设置列值
+func (ub *UpdateBuilder) Sets(values map[string]interface{}) *UpdateBuilder {
+	for k, v := range values {
+		ub.updates[k] = v
+	}
+	return ub
+}
+
+// Where 设置更新条件
+func (ub *UpdateBuilder) Where(condition string) *UpdateBuilder {
+	ub.condition = condition
+	return ub
+}
+
+// Execute 执行更新，返回影响行数
+func (ub *UpdateBuilder) Execute() (int64, error) {
+	if len(ub.updates) == 0 {
+		return 0, fmt.Errorf("no columns to update")
+	}
+	if ub.condition == "" {
+		return 0, fmt.Errorf("UPDATE without WHERE is not allowed for safety")
+	}
+	if err := ub.db.UpdateRow(ub.tableName, ub.updates, ub.condition); err != nil {
+		return 0, err
+	}
+	return -1, nil // WeDB Go API 不返回受影响行数
+}
+
+// ===== DeleteBuilder =====
+
+// DeleteBuilder 删除数据构建器
+// 用法: db.Delete("users").Where("age < 18").Execute()
+type DeleteBuilder struct {
+	db        Adapter
+	tableName string
+	condition string
+}
+
+// Where 设置删除条件
+func (db *DeleteBuilder) Where(condition string) *DeleteBuilder {
+	db.condition = condition
+	return db
+}
+
+// Execute 执行删除，返回影响行数
+func (db *DeleteBuilder) Execute() (int64, error) {
+	if db.condition == "" {
+		return 0, fmt.Errorf("DELETE without WHERE is not allowed for safety")
+	}
+	if err := db.db.DeleteRow(db.tableName, db.condition); err != nil {
+		return 0, err
+	}
+	return -1, nil // WeDB Go API 不返回受影响行数
+}
+
+// ===== DDL 辅助函数 =====
+
+// NewTableSchema 创建表结构定义
+// 用法: wqlv3.NewTableSchema("users",
+//
+//	wqlv3.NewColumn("id", "INTEGER", false),
+//	wqlv3.NewColumn("name", "TEXT", true),
+//	wqlv3.NewColumn("age", "INTEGER", true),
+//	wqlv3.NewPrimaryKey("id"))
+func NewTableSchema(name string, columns ...*ColumnDef) *TableSchema {
+	return &TableSchema{
+		Name:    name,
+		Columns: derefColumns(columns),
+	}
+}
+
+// NewColumn 创建列定义
+func NewColumn(name, typ string, nullable bool) *ColumnDef {
+	return &ColumnDef{
+		Name:     name,
+		Type:     typ,
+		Nullable: nullable,
+	}
+}
+
+func derefColumns(cols []*ColumnDef) []ColumnDef {
+	out := make([]ColumnDef, 0, len(cols))
+	for _, c := range cols {
+		if c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out
+}
+
 // ===== Fluent API =====
 
 // Table 创建表查询构建器
@@ -80,6 +233,45 @@ func (d *Database) Table(name string) *QueryBuilder {
 		tableName: name,
 		selects:   nil, // nil = SELECT *
 	}
+}
+
+// Insert 创建插入构建器
+// 用法: db.Insert("users").Values(map[string]interface{}{"id": 1, "name": "alice"}).Execute()
+func (d *Database) Insert(tableName string) *InsertBuilder {
+	return &InsertBuilder{
+		db:        d.adapter,
+		tableName: tableName,
+	}
+}
+
+// Update 创建更新构建器
+// 用法: db.Update("users").Set("name", "bob").Where("id = 1").Execute()
+func (d *Database) Update(tableName string) *UpdateBuilder {
+	return &UpdateBuilder{
+		db:        d.adapter,
+		tableName: tableName,
+		updates:   make(map[string]interface{}),
+	}
+}
+
+// Delete 创建删除构建器
+// 用法: db.Delete("users").Where("age < 18").Execute()
+func (d *Database) Delete(tableName string) *DeleteBuilder {
+	return &DeleteBuilder{
+		db:        d.adapter,
+		tableName: tableName,
+	}
+}
+
+// CreateTable 创建表（DDL）
+// 用法: db.CreateTable(wqlv3.NewTableSchema("users", wqlv3.NewColumn("id", "INTEGER", false), ...))
+func (d *Database) CreateTable(schema *TableSchema) error {
+	return d.adapter.CreateTable(schema)
+}
+
+// DropTable 删除表（DDL）
+func (d *Database) DropTable(tableName string) error {
+	return d.adapter.DropTable(tableName)
 }
 
 // QueryBuilder 链式查询构建器

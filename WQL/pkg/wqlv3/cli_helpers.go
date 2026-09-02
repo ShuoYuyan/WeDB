@@ -4,17 +4,19 @@ package wqlv3
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // QueryResult 统一的查询结果封装
 type QueryResult struct {
-	Rows      []map[string]interface{} // 查询行
-	Value     interface{}              // 聚合值（Count/Sum/Avg/Min/Max）
-	Columns   []string                 // 显式选择的列
-	Duration  time.Duration             // 执行时间
-	Statement string                   // 原始语句（用于显示）
+	Rows         []map[string]interface{} // 查询行
+	Value        interface{}              // 聚合值（Count/Sum/Avg/Min/Max）
+	Columns      []string                 // 显式选择的列
+	Duration     time.Duration             // 执行时间
+	Statement    string                   // 原始语句（用于显示）
+	AffectedRows int64                    // INSERT/UPDATE/DELETE 影响行数（-1 表示未知）
 }
 
 // ListTables 列出所有表
@@ -79,6 +81,13 @@ func inferType(v interface{}) string {
 
 // PrintResult 以表格形式打印结果
 func PrintResult(r QueryResult) {
+	// DML 操作结果
+	if r.AffectedRows > 0 || r.AffectedRows == 0 && (len(r.Rows) == 0 && r.Value == nil) {
+		if r.Value != nil {
+			fmt.Printf("  %v\n", formatValueForPrint(r.Value))
+		}
+		return
+	}
 	if r.Value != nil {
 		// 单值结果（聚合）
 		fmt.Printf("  %v\n", formatValueForPrint(r.Value))
@@ -243,7 +252,11 @@ func formatValueForPrint(v interface{}) string {
 
 // EvaluateQuery 解析 WQL 方法链字符串并执行
 // 这是 CLI 的核心入口。
-// 接受的格式: db.Table("name").Where(cond).All() 或 Table("name").Where(cond).All()
+// 接受的格式:
+//   - SELECT: T("name").Where(cond).All() 或 Table("name").Where(cond).All()
+//   - INSERT: Insert("name").Values({...}).Execute()
+//   - UPDATE: Update("name").Set(col, val).Where(cond).Execute()
+//   - DELETE: Delete("name").Where(cond).Execute()
 //
 // 由于完整的 WQL 解析需要复杂的语法分析（pkg/wql/lexer/parser），
 // 这里采用简化的正则式解析。
@@ -251,6 +264,29 @@ func EvaluateQuery(db *Database, expr string) (QueryResult, error) {
 	expr = strings.TrimSpace(expr)
 	result := QueryResult{Statement: expr, Duration: 0}
 	start := time.Now()
+
+	upper := strings.ToUpper(expr)
+
+	// INSERT 语句
+	if strings.HasPrefix(upper, "INSERT(") {
+		return evaluateInsert(db, expr, start, result)
+	}
+	// UPDATE 语句
+	if strings.HasPrefix(upper, "UPDATE(") {
+		return evaluateUpdate(db, expr, start, result)
+	}
+	// DELETE 语句
+	if strings.HasPrefix(upper, "DELETE(") {
+		return evaluateDelete(db, expr, start, result)
+	}
+	// CREATE TABLE 语句
+	if strings.HasPrefix(upper, "CREATETABLE(") {
+		return evaluateCreateTable(db, expr, start, result)
+	}
+	// DROP TABLE 语句
+	if strings.HasPrefix(upper, "DROPTABLE(") {
+		return evaluateDropTable(db, expr, start, result)
+	}
 
 	// 提取表名: T("name") 或 .Table("name") 或 Table("name")
 	tableName, rest, err := parseTableRef(expr)
@@ -531,4 +567,524 @@ func parseLastMethod(rest string) (string, []string) {
 		}
 	}
 	return method, args
+}
+
+// ===== DML 评估器（CLI 字符串接口） =====
+
+// evaluateInsert 处理 INSERT("table").Values({...}).Execute()
+// 简化语法:
+//   Insert("users").Values(map[string]interface{}{"id": 1, "name": "alice"}).Execute()
+//   Insert("users").Values({id: 1, name: "alice"}).Execute()
+func evaluateInsert(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
+	// 提取表名: Insert("name")
+	idx := strings.Index(expr, "Insert(")
+	if idx < 0 {
+		return result, fmt.Errorf("malformed INSERT")
+	}
+	tableName, rest, err := extractQuotedName(expr[idx+7:])
+	if err != nil {
+		return result, fmt.Errorf("malformed INSERT: %w", err)
+	}
+
+	// 提取 Values(...)
+	row, err := extractOneRow(rest)
+	if err != nil {
+		return result, fmt.Errorf("failed to parse VALUES: %w", err)
+	}
+
+	n, err := db.Insert(tableName).Value(row).Execute()
+	result.Duration = time.Since(start)
+	if err != nil {
+		return result, err
+	}
+	result.AffectedRows = n
+	result.Rows = nil
+	result.Value = fmt.Sprintf("INSERT OK (%d row(s))", n)
+	return result, nil
+}
+
+// evaluateUpdate 处理 UPDATE("table").Set(col, val).Where(cond).Execute()
+// 简化语法:
+//   Update("users").Set("name", "bob").Where("id = 1").Execute()
+//   Update("users").Sets({name: "bob", age: 30}).Where("id = 1").Execute()
+func evaluateUpdate(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
+	idx := strings.Index(expr, "Update(")
+	if idx < 0 {
+		return result, fmt.Errorf("malformed UPDATE")
+	}
+	tableName, rest, err := extractQuotedName(expr[idx+7:])
+	if err != nil {
+		return result, fmt.Errorf("malformed UPDATE: %w", err)
+	}
+
+	ub := db.Update(tableName)
+
+	// 解析 Set(col, val) 调用
+	if err := parseSetCalls(rest, ub); err != nil {
+		return result, fmt.Errorf("failed to parse SET: %w", err)
+	}
+
+	// 解析 .Where(cond)
+	if w := extractWhere(rest); w != "" {
+		ub.Where(w)
+	}
+
+	n, err := ub.Execute()
+	result.Duration = time.Since(start)
+	if err != nil {
+		return result, err
+	}
+	result.AffectedRows = n
+	result.Value = fmt.Sprintf("UPDATE OK")
+	return result, nil
+}
+
+// evaluateDelete 处理 DELETE("table").Where(cond).Execute()
+func evaluateDelete(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
+	idx := strings.Index(expr, "Delete(")
+	if idx < 0 {
+		return result, fmt.Errorf("malformed DELETE")
+	}
+	tableName, rest, err := extractQuotedName(expr[idx+7:])
+	if err != nil {
+		return result, fmt.Errorf("malformed DELETE: %w", err)
+	}
+
+	db_ := db.Delete(tableName)
+	if w := extractWhere(rest); w != "" {
+		db_.Where(w)
+	}
+
+	n, err := db_.Execute()
+	result.Duration = time.Since(start)
+	if err != nil {
+		return result, err
+	}
+	result.AffectedRows = n
+	result.Value = fmt.Sprintf("DELETE OK")
+	return result, nil
+}
+
+// evaluateCreateTable 处理 CREATE TABLE
+// 简化语法: CreateTable("users", {id: "INTEGER PK", name: "TEXT", age: "INTEGER"})
+// 或:      CreateTable("users", ["id INTEGER PRIMARY KEY", "name TEXT", "age INTEGER"])
+func evaluateCreateTable(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
+	// 跳过 "CreateTable(" 前缀
+	rest := expr[12:]
+	// 第一个参数: 表名（带引号）
+	tableName, rest, err := extractQuotedName(rest)
+	if err != nil {
+		return result, fmt.Errorf("malformed CREATE TABLE: %w", err)
+	}
+	tableName = strings.TrimSpace(tableName)
+
+	// 解析列定义（简化版：col1 TYPE, col2 TYPE, ...）
+	// 找到第一个 ),然后去掉尾部的 )
+	colDefs, err := parseColumnDefs(rest)
+	if err != nil {
+		return result, fmt.Errorf("failed to parse column definitions: %w", err)
+	}
+
+	schema := NewTableSchema(tableName, colDefs...)
+	if err := db.CreateTable(schema); err != nil {
+		return result, err
+	}
+	result.Duration = time.Since(start)
+	result.Value = fmt.Sprintf("CREATE TABLE %s OK (%d columns)", tableName, len(colDefs))
+	return result, nil
+}
+
+// evaluateDropTable 处理 DROP TABLE
+func evaluateDropTable(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
+	rest := expr[10:]
+	tableName, _, err := extractQuotedName(rest)
+	if err != nil {
+		return result, fmt.Errorf("malformed DROP TABLE: %w", err)
+	}
+	tableName = strings.TrimSpace(tableName)
+	if err := db.DropTable(tableName); err != nil {
+		return result, err
+	}
+	result.Duration = time.Since(start)
+	result.Value = fmt.Sprintf("DROP TABLE %s OK", tableName)
+	return result, nil
+}
+
+// ===== DML 解析辅助函数 =====
+
+// extractQuotedName 提取括号内的带引号字符串
+// 输入: `"users").Values(...)` 输出: `users`, `).Values(...)`
+func extractQuotedName(s string) (string, string, error) {
+	if len(s) == 0 {
+		return "", "", fmt.Errorf("empty")
+	}
+	// 跳过前导空白
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	if i >= len(s) {
+		return "", "", fmt.Errorf("empty after trim")
+	}
+	if s[i] != '"' && s[i] != '\'' {
+		return "", "", fmt.Errorf("expected quoted string at position %d, got %q", i, s[i])
+	}
+	quote := s[i]
+	end := strings.IndexByte(s[i+1:], quote)
+	if end < 0 {
+		return "", "", fmt.Errorf("unterminated string")
+	}
+	name := s[i+1 : i+1+end]
+	rest := s[i+1+end+1:]
+	return name, rest, nil
+}
+
+// extractOneRow 提取 Values(...) 中的单行数据
+// 支持格式: Values({"key": value, "key2": value2})
+//        或 Values({key: value, key2: value2})
+func extractOneRow(rest string) (map[string]interface{}, error) {
+	// 找 .Values(
+	idx := strings.Index(strings.ToUpper(rest), ".VALUES(")
+	if idx < 0 {
+		return nil, fmt.Errorf("no .Values() found")
+	}
+	rest = rest[idx+8:]
+	// 找匹配的 )
+	depth := 0
+	end := -1
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '{', '(':
+			depth++
+		case '}', ')':
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return nil, fmt.Errorf("malformed .Values()")
+	}
+	content := rest[:end]
+	return parseRowObject(content)
+}
+
+// parseRowObject 解析 {key: value, key2: value2}
+// 简化实现：只支持字符串和数字值
+func parseRowObject(s string) (map[string]interface{}, error) {
+	out := make(map[string]interface{})
+	// 去掉首尾的大括号
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return out, nil
+	}
+	if strings.HasPrefix(s, "{") {
+		s = s[1:]
+	}
+	if strings.HasSuffix(s, "}") {
+		s = s[:len(s)-1]
+	}
+
+	// 按逗号分割，但要处理嵌套
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{', '(':
+			depth++
+		case '}', ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				pair := strings.TrimSpace(s[start:i])
+				if err := parseKV(pair, out); err != nil {
+					return nil, err
+				}
+				start = i + 1
+			}
+		}
+	}
+	if start < len(s) {
+		pair := strings.TrimSpace(s[start:])
+		if pair != "" {
+			if err := parseKV(pair, out); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// parseKV 解析 "key": value 或 key: value
+func parseKV(s string, out map[string]interface{}) error {
+	colon := -1
+	depth := 0
+	inStr := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr != 0 {
+			if c == inStr {
+				inStr = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			inStr = c
+		case '{', '(':
+			depth++
+		case '}', ')':
+			depth--
+		case ':':
+			if depth == 0 {
+				colon = i
+				break
+			}
+		}
+		if colon >= 0 {
+			break
+		}
+	}
+	if colon < 0 {
+		return fmt.Errorf("missing colon in: %s", s)
+	}
+	key := strings.TrimSpace(s[:colon])
+	// 去掉 key 的引号
+	key = strings.Trim(key, `"'`)
+	value := strings.TrimSpace(s[colon+1:])
+
+	out[key] = parseValueSimple(value)
+	return nil
+}
+
+// parseValueSimple 解析简单字面量
+func parseValueSimple(s string) interface{} {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// 字符串
+	if (strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`)) ||
+		(strings.HasPrefix(s, `'`) && strings.HasSuffix(s, `'`)) {
+		return s[1 : len(s)-1]
+	}
+	// null
+	if strings.ToUpper(s) == "NULL" {
+		return nil
+	}
+	// 布尔
+	upper := strings.ToUpper(s)
+	if upper == "TRUE" {
+		return true
+	}
+	if upper == "FALSE" {
+		return false
+	}
+	// 整数
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i
+	}
+	// 浮点
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	// 默认字符串（去掉引号）
+	return strings.Trim(s, `"'`)
+}
+
+// parseSetCalls 解析 .Set(col, val).Set(col2, val2) 或 .Sets({...})
+func parseSetCalls(rest string, ub *UpdateBuilder) error {
+	upper := strings.ToUpper(rest)
+	// 找 .Sets({...})
+	idx := strings.Index(upper, ".SETS(")
+	if idx >= 0 {
+		rest2 := rest[idx+6:]
+		depth := 0
+		end := -1
+		for i := 0; i < len(rest2); i++ {
+			switch rest2[i] {
+			case '(', '{':
+				depth++
+			case ')', '}':
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end >= 0 {
+			row, err := parseRowObject(rest2[:end+1])
+			if err != nil {
+				return err
+			}
+			ub.Sets(row)
+			return nil
+		}
+	}
+
+	// 找所有 .Set(col, val)
+	searchPos := 0
+	for {
+		idx := strings.Index(upper[searchPos:], ".SET(")
+		if idx < 0 {
+			break
+		}
+		idx += searchPos
+		rest2 := rest[idx+5:]
+		end := -1
+		depth := 0
+		inStr := byte(0)
+		for i := 0; i < len(rest2); i++ {
+			c := rest2[i]
+			if inStr != 0 {
+				if c == inStr {
+					inStr = 0
+				}
+				continue
+			}
+			switch c {
+			case '"', '\'':
+				inStr = c
+			case '(':
+				depth++
+			case ')':
+				if depth == 0 {
+					end = i
+					break
+				}
+				depth--
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			return fmt.Errorf("malformed .Set()")
+		}
+		// 解析 col, val
+		// rest2[:end] 排除了末尾的 )
+		args := splitArgs(rest2[:end])
+		if len(args) < 2 {
+			return fmt.Errorf("Set() requires 2 arguments: col, value")
+		}
+		col := strings.Trim(args[0], `"'`)
+		val := parseValueSimple(strings.Join(args[1:], ","))
+		ub.Set(col, val)
+		searchPos = idx + 5 + end + 1
+	}
+	return nil
+}
+
+// extractWhere 提取 .Where(cond) 中的条件
+func extractWhere(rest string) string {
+	upper := strings.ToUpper(rest)
+	idx := strings.Index(upper, ".WHERE(")
+	if idx < 0 {
+		return ""
+	}
+	rest2 := rest[idx+7:]
+	depth := 0
+	inStr := byte(0)
+	end := -1
+	for i := 0; i < len(rest2); i++ {
+		c := rest2[i]
+		if inStr != 0 {
+			if c == inStr {
+				inStr = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			inStr = c
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				end = i
+				break
+			}
+			depth--
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return ""
+	}
+	// rest2[:end] 排除了末尾的 )
+	// 同时去掉首尾的引号（CLI 语法使用 "col = val" 风格）
+	cond := strings.TrimSpace(rest2[:end])
+	cond = strings.Trim(cond, `"'`)
+	return cond
+}
+
+// parseColumnDefs 解析 CREATE TABLE 的列定义
+// 简化语法: "id INTEGER PRIMARY KEY", "name TEXT NOT NULL", "age INTEGER"
+func parseColumnDefs(s string) ([]*ColumnDef, error) {
+	// 找到第一个 ( 表示列定义开始
+	start := strings.Index(s, "(")
+	if start < 0 {
+		return nil, fmt.Errorf("expected ( for column definitions")
+	}
+	s = s[start+1:]
+	// 找到匹配的 )
+	depth := 1
+	end := -1
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return nil, fmt.Errorf("unmatched parentheses")
+	}
+	content := s[:end]
+
+	// 按逗号分割列定义
+	parts := splitArgs(content)
+	var cols []*ColumnDef
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// 格式: "name TYPE [NOT NULL] [PRIMARY KEY]" 或  name TYPE
+		p = strings.Trim(p, `"'`)
+		tokens := strings.Fields(p)
+		if len(tokens) < 2 {
+			return nil, fmt.Errorf("invalid column definition: %s", p)
+		}
+		name := tokens[0]
+		typ := strings.ToUpper(tokens[1])
+		nullable := true
+		for i := 2; i < len(tokens); i++ {
+			if strings.ToUpper(tokens[i]) == "NOT" && i+1 < len(tokens) && strings.ToUpper(tokens[i+1]) == "NULL" {
+				nullable = false
+				break
+			}
+		}
+		cols = append(cols, NewColumn(name, typ, nullable))
+	}
+	return cols, nil
 }
