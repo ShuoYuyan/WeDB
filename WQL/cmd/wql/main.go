@@ -47,8 +47,11 @@ Available commands:
   ddl <wql>           - Execute a DDL statement (CREATE/DROP TABLE)
   dml <wql>           - Execute a DML statement (INSERT/UPDATE/DELETE)
   query <wql>         - Execute a SELECT-like query
+  explain <wql>       - Show the query plan without executing
+  format <wql>        - Pretty-print a WQL query with syntax highlighting
+  history             - Show command history
   help                - Show this help
-  quit / exit          - Exit the REPL
+  quit / exit         - Exit the REPL
 
 WQL Syntax (fluent API, no SQL strings):
   T(<table>)                 - Reference a table
@@ -104,7 +107,18 @@ func main() {
 	defer wdb.Close()
 
 	if query != "" {
-		// 单条查询模式
+		// 单条查询模式 - 先识别 REPL 元命令
+		trimmed := strings.TrimSpace(query)
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "explain "):
+			handleExplain(strings.TrimSpace(trimmed[len("explain "):]))
+			return
+		case strings.HasPrefix(lower, "format "):
+			handleFormat(strings.TrimSpace(trimmed[len("format "):]))
+			return
+		}
+		// 否则执行 WQL 查询
 		runQuery(wdb, query)
 		return
 	}
@@ -174,6 +188,16 @@ func runREPL(wdb *wqlv3.Database, dbPath string) {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 允许 1MB 行
 
+	// 命令历史
+	history := newHistory(100)
+
+	// 启动历史文件加载（如果存在）
+	histFile := os.Getenv("WQL_HISTFILE")
+	if histFile == "" {
+		histFile = ".wql_history"
+	}
+	_ = history.loadFromFile(histFile)
+
 	for {
 		fmt.Print("wql> ")
 		if !scanner.Scan() {
@@ -186,9 +210,13 @@ func runREPL(wdb *wqlv3.Database, dbPath string) {
 			continue
 		}
 
+		// 记录到历史
+		history.add(line)
+
 		lower := strings.ToLower(line)
 		switch {
 		case lower == "quit" || lower == "exit" || lower == ":q":
+			_ = history.saveToFile(histFile)
 			fmt.Println("Bye!")
 			return
 		case lower == "help" || lower == "?" || lower == ":h":
@@ -200,8 +228,17 @@ func runREPL(wdb *wqlv3.Database, dbPath string) {
 		case strings.HasPrefix(lower, "schema "):
 			handleSchema(wdb, strings.TrimSpace(line[7:]))
 			continue
+		case lower == "history":
+			history.print()
+			continue
 		case lower == "clear" || lower == "cls":
 			clearScreen()
+			continue
+		case strings.HasPrefix(lower, "explain "):
+			handleExplain(strings.TrimSpace(line[len("explain "):]))
+			continue
+		case strings.HasPrefix(lower, "format "):
+			handleFormat(strings.TrimSpace(line[len("format "):]))
 			continue
 		}
 
@@ -269,4 +306,97 @@ func countRows(result wqlv3.QueryResult) int {
 
 func clearScreen() {
 	fmt.Print("\033[H\033[2J")
+}
+
+// handleExplain 显示查询计划（不执行）
+func handleExplain(query string) {
+	if query == "" {
+		fmt.Println("  ERROR: usage: explain <wql-query>")
+		return
+	}
+	plan, err := wqlv3.Explain(query)
+	if err != nil {
+		fmt.Printf("  ERROR: %v\n", err)
+		return
+	}
+	fmt.Print(plan.String())
+}
+
+// handleFormat 格式化/高亮显示 WQL 查询
+func handleFormat(query string) {
+	if query == "" {
+		fmt.Println("  ERROR: usage: format <wql-query>")
+		return
+	}
+	fmt.Println(wqlv3.HighlightSimple(query))
+}
+
+// ===== 命令历史 =====
+
+// history 简单的命令行历史记录
+type history struct {
+	items []string
+	cap   int
+}
+
+func newHistory(cap int) *history {
+	return &history{cap: cap}
+}
+
+func (h *history) add(item string) {
+	if item == "" {
+		return
+	}
+	// 去除与最后一条重复
+	if len(h.items) > 0 && h.items[len(h.items)-1] == item {
+		return
+	}
+	if len(h.items) >= h.cap {
+		h.items = h.items[1:]
+	}
+	h.items = append(h.items, item)
+}
+
+func (h *history) print() {
+	if len(h.items) == 0 {
+		fmt.Println("  (no history)")
+		return
+	}
+	fmt.Printf("  %d command(s) in history:\n", len(h.items))
+	// 只显示最近 20 条
+	start := 0
+	if len(h.items) > 20 {
+		start = len(h.items) - 20
+	}
+	for i := start; i < len(h.items); i++ {
+		fmt.Printf("    %3d  %s\n", i+1, h.items[i])
+	}
+}
+
+func (h *history) loadFromFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 64*1024)
+	for sc.Scan() {
+		h.add(sc.Text())
+	}
+	return nil
+}
+
+func (h *history) saveToFile(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, item := range h.items {
+		if _, err := f.WriteString(item + "\n"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
