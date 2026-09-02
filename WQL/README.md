@@ -79,7 +79,23 @@ avg, _ := wdb.Table("orders").Avg("amount")
 row, _ := wdb.Table("users").Where("email = 'alice@x.com'").First()
 ```
 
-### 方式 2: 字符串接口（用于 CLI / 配置文件 / 远程协议）
+### 方式 2: WQL 无双引号字符串（推荐 — 真正的 WQL 语法）
+
+WQL 的设计原则是**无双引号**：标识符（表名、列名）不需要引号。
+
+```go
+result, err := wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(users).Where(age > 18).All()`)
+result, err := wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(orders).Select(city, Count()).GroupBy(city).All()`)
+result, err := wqlv3.EvaluateQueryNoQuotes(wdb, `db.Table(users).Where(name = "alice").First()`)
+```
+
+**语法要点**:
+- 表名、列名**不加引号**：`db.Table(users)`, `Select(name, age)`
+- 字符串值需要引号：`name = "alice"`
+- 数字不加引号：`age > 18`
+- 操作链：`db.Table(t).Select(...).Where(...).OrderBy(..., DESC).Take(N).All()`
+
+### 方式 3: 旧字符串接口（向后兼容，带双引号）
 
 ```go
 result, err := wqlv3.EvaluateQuery(wdb, `T("users").Where("age > 18").All()`)
@@ -125,7 +141,7 @@ wql> tables
   Found 1 table(s):
     - users
 
-wql> T("users").All()
+wql> db.Table(users).All()
   id  name  age
   --  ----  ---
   1   alice 30
@@ -134,14 +150,13 @@ wql> T("users").All()
 
   3 row(s) in 0.123ms
 
-wql> T("users").Where("age > 18").Count()
-  3
-  result: 3
+wql> db.Table(users).Select(name, age).Where(age > 18).OrderBy(age, DESC).Take(2).All()
+  name  age
+  ----  ---
+  carol 40
+  alice 30
 
-wql> T("users").Sum("age")
-  result: 95
-
-wql> T("users").Where("name = 'alice'").First()
+wql> db.Table(users).Where(name = "alice").First()
   id  name  age
   --  ----  ---
   1   alice 30
@@ -149,6 +164,10 @@ wql> T("users").Where("name = 'alice'").First()
 wql> quit
 Bye!
 ```
+
+> **设计原则**: WQL 使用**无双引号**语法 — 标识符（表名、列名）不需要引号，只有字符串值才需要。
+> 例: `db.Table(users).Select(name, age).Where(name = "alice").All()`
+> 而**不是**: `db.Table("users").Select("name", "age").Where("name = \"alice\"").All()`
 
 ### 单次查询模式
 ```cmd
@@ -211,12 +230,14 @@ go test ./pkg/wqlv3/
 
 当前 wqlv3 实现的功能：
 - ✅ SELECT（带列过滤、WHERE、ORDER BY、SKIP、TAKE）
-- ✅ 聚合（Count, Sum, Avg, Min, Max）
+- ✅ INSERT / UPDATE / DELETE（DML 完整支持）
+- ✅ CREATE TABLE / DROP TABLE（DDL 基础支持）
+- ✅ 聚合（Count, Sum, Avg, Min, Max — 通过 Go API）
 - ✅ WHERE 过滤（=, !=, <, >, AND, OR, NOT, IN, LIKE, IS NULL, IS NOT NULL）
-- ❌ INSERT / UPDATE / DELETE（待实现，需扩展 Adapter 接口）
-- ❌ JOIN（待实现）
-- ❌ 嵌套子查询（待实现）
-- ❌ GROUP BY / HAVING（待实现）
+- ✅ WQL 无双引号解析器（lexer + parser + AST）
+- ❌ JOIN（parser 暂不支持）
+- ❌ GROUP BY / HAVING（parser 暂不支持）
+- ❌ 嵌套子查询（parser 暂不支持）
 - ❌ 窗口函数（待实现）
 
 ## 项目历史

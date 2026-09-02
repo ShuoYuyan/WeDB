@@ -131,16 +131,36 @@ func printGlobalHelp() {
 }
 
 // runQuery 执行单条 WQL 查询并打印结果
+// 优先使用 WQL 无双引号解析器（真正的 WQL 语法）：
+//   db.Table(users).Select(name, age).Where(age > 18).All()
+//   db.Table(orders).Sum(amount)
+//   db.Table(users).Where(name = "alice").First()
+//
+// 失败时回退到旧的字符串解析器（向后兼容）：
+//   T("users").Where("age > 18").All()
 func runQuery(wdb *wqlv3.Database, query string) {
-	// 使用 wqlv3 的 Database.Table() 入口
-	// 用户需要写完整方法链，如: users.Select(name).Where(age>18).All()
-	// 但这样不够灵活。WQLv3 也支持通过 wdb.Table(name).XXX() 链式调用。
-	// 这里的简单模式是: 把整个字符串作为表达式执行。
+	var result wqlv3.QueryResult
+	var err error
 
-	result, err := wqlv3.EvaluateQuery(wdb, query)
+	// 优先尝试 WQL 无双引号解析器（标准 WQL 语法）
+	if strings.HasPrefix(query, "db.") {
+		result, err = wqlv3.EvaluateQueryNoQuotes(wdb, query)
+	} else {
+		// 旧语法: T("table").Where(...).All()
+		result, err = wqlv3.EvaluateQuery(wdb, query)
+	}
+
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		// 回退尝试：如果标准语法失败，尝试旧的字符串接口
+		if !strings.HasPrefix(query, "db.") {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		result, err = wqlv3.EvaluateQuery(wdb, query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	wqlv3.PrintResult(result)
 }
@@ -186,8 +206,16 @@ func runREPL(wdb *wqlv3.Database, dbPath string) {
 		}
 
 		// 视为 WQL 查询
+		// 优先使用 WQL 无双引号语法：db.Table(users).Select(...).All()
+		// 如果不是 db. 开头，回退到旧字符串语法
 		start := time.Now()
-		result, err := wqlv3.EvaluateQuery(wdb, line)
+		var result wqlv3.QueryResult
+		var err error
+		if strings.HasPrefix(line, "db.") {
+			result, err = wqlv3.EvaluateQueryNoQuotes(wdb, line)
+		} else {
+			result, err = wqlv3.EvaluateQuery(wdb, line)
+		}
 		if err != nil {
 			fmt.Printf("  ERROR: %v\n", err)
 			continue
