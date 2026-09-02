@@ -118,6 +118,12 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 				dir = "ASC"
 			}
 			qb = qb.OrderBy(col, dir)
+		case *parser.AggregateOperation:
+			col := ""
+			if o.Column != nil {
+				col = exprToString(o.Column)
+			}
+			qb = qb.AddAggregate(o.Function, col, o.Alias)
 		case *parser.TakeOperation:
 			n, err := exprToInt(o.Count)
 			if err != nil {
@@ -305,6 +311,7 @@ func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (Query
 		for _, op := range ops {
 			switch op.(type) {
 			case *parser.AllOperation, *parser.FirstOperation,
+				*parser.AggregateOperation,
 				*parser.SelectOperation, *parser.WhereOperation, *parser.OrderByOperation,
 				*parser.TakeOperation, *parser.SkipOperation, *parser.LimitOperation,
 				*parser.GroupByOperation, *parser.HavingOperation, *parser.JoinOperation:
@@ -335,6 +342,45 @@ func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (Query
 			}
 			if row != nil {
 				result.Rows = []map[string]interface{}{row}
+			}
+			return result, nil
+		case *parser.AggregateOperation:
+			o := op.(*parser.AggregateOperation)
+			col := ""
+			if o.Column != nil {
+				col = exprToString(o.Column)
+			}
+			switch o.Function {
+			case "Count":
+				v, err := qb.Count()
+				if err != nil {
+					return result, err
+				}
+				result.Value = v
+			case "Sum":
+				v, err := qb.Sum(col)
+				if err != nil {
+					return result, err
+				}
+				result.Value = v
+			case "Avg":
+				v, err := qb.Avg(col)
+				if err != nil {
+					return result, err
+				}
+				result.Value = v
+			case "Min":
+				v, err := qb.Min(col)
+				if err != nil {
+					return result, err
+				}
+				result.Value = v
+			case "Max":
+				v, err := qb.Max(col)
+				if err != nil {
+					return result, err
+				}
+				result.Value = v
 			}
 			return result, nil
 		}

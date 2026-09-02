@@ -128,6 +128,9 @@ func (p *Parser) parseOperation() (Operation, error) {
 		return p.parseFirstOperation()
 	case lexer.TOKEN_ALL:
 		return p.parseAllOperation()
+	case lexer.TOKEN_COUNT, lexer.TOKEN_SUM, lexer.TOKEN_AVG,
+		lexer.TOKEN_MIN, lexer.TOKEN_MAX:
+		return p.parseAggregateOperation()
 	case lexer.TOKEN_UNION, lexer.TOKEN_UNION_ALL:
 		return p.parseUnionOperation()
 	case lexer.TOKEN_INTERSECT:
@@ -468,6 +471,45 @@ func (p *Parser) parseAllOperation() (*AllOperation, error) {
 	p.nextToken()
 
 	return &AllOperation{}, nil
+}
+
+// parseAggregateOperation 解析聚合终端操作：Count() / Sum(col) / Avg(col) / Min(col) / Max(col)
+// 支持别名：Count() AS cnt, Sum(amount) AS total
+func (p *Parser) parseAggregateOperation() (*AggregateOperation, error) {
+	funcName := p.currentToken.Value
+	p.nextToken()
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after %s, got %s", funcName, p.currentToken.Type)
+	}
+	p.nextToken()
+
+	agg := &AggregateOperation{Function: funcName}
+	// Count() 不需要参数；Sum/Avg/Min/Max 需要 1 个参数
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		col, err := p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse %s column: %w", funcName, err)
+		}
+		agg.Column = col
+	}
+
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' in %s, got %s", funcName, p.currentToken.Type)
+	}
+	p.nextToken()
+
+	// 可选: AS alias
+	if p.currentToken.Type == lexer.TOKEN_AS {
+		p.nextToken()
+		if p.currentToken.Type != lexer.TOKEN_IDENTIFIER {
+			return nil, fmt.Errorf("expected identifier after AS, got %s", p.currentToken.Type)
+		}
+		agg.Alias = p.currentToken.Value
+		p.nextToken()
+	}
+
+	return agg, nil
 }
 
 // parseUnionOperation 解析UNION操作
