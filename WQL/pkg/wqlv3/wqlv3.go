@@ -297,6 +297,16 @@ type QueryBuilder struct {
 	skipN     int64
 	takeN     int64
 	joins     []JoinSpec // JOIN 链
+	groupBy   []string   // GROUP BY 列
+	having    string     // HAVING 条件（已格式化）
+	aggFuncs  []AggSpec  // 聚合函数规格（仅在有 GROUP BY 时使用）
+}
+
+// AggSpec 聚合函数规格
+type AggSpec struct {
+	Function string // "Count" / "Sum" / "Avg" / "Min" / "Max"
+	Column   string // 列名；Count() 为空表示 COUNT(*)
+	Alias    string // 可选别名
 }
 
 // Select 指定要查询的列
@@ -342,6 +352,28 @@ func (qb *QueryBuilder) Join(joinType, table, leftKey, rightKey, onExpr string) 
 		LeftKey:  leftKey,
 		RightKey: rightKey,
 		OnExpr:   onExpr,
+	})
+	return qb
+}
+
+// GroupBy 设置 GROUP BY 列
+func (qb *QueryBuilder) GroupBy(cols ...string) *QueryBuilder {
+	qb.groupBy = append(qb.groupBy, cols...)
+	return qb
+}
+
+// Having 设置 HAVING 条件
+func (qb *QueryBuilder) Having(condition string) *QueryBuilder {
+	qb.having = condition
+	return qb
+}
+
+// AddAggregate 显式注册聚合函数
+func (qb *QueryBuilder) AddAggregate(fn, col, alias string) *QueryBuilder {
+	qb.aggFuncs = append(qb.aggFuncs, AggSpec{
+		Function: fn,
+		Column:   col,
+		Alias:    alias,
 	})
 	return qb
 }
@@ -411,17 +443,29 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 		rows = filterRows(rows, qb.where)
 	}
 
-	// 第4步: SELECT 列投影（最后一步）
+	// 第4步: GROUP BY + 聚合
+	if len(qb.groupBy) > 0 || len(qb.aggFuncs) > 0 {
+		rows = groupAndAggregate(rows, qb.groupBy, qb.aggFuncs)
+	}
+
+	// 第5步: HAVING 过滤（聚合后）
+	if qb.having != "" {
+		// 将 HAVING 中的 "Func(col)" 形式重写为已合成的 key，便于 ParseWhere 识别
+		havingRewritten := rewriteHavingAggregates(qb.having, qb.aggFuncs)
+		rows = filterRows(rows, havingRewritten)
+	}
+
+	// 第6步: SELECT 列投影
 	if len(qb.selects) > 0 {
 		rows = projectColumns(rows, qb.selects)
 	}
 
-	// 第5步: ORDER BY 排序
+	// 第7步: ORDER BY 排序
 	if qb.orderCol != "" {
 		rows = sortRows(rows, qb.orderCol, qb.orderDir)
 	}
 
-	// 第6步: SKIP / TAKE
+	// 第8步: SKIP / TAKE
 	if qb.skipN > 0 || qb.takeN > 0 {
 		start := int(qb.skipN)
 		if start > len(rows) {
@@ -435,6 +479,252 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 	}
 
 	return rows, nil
+}
+
+// rewriteHavingAggregates 将 HAVING 字符串中的 "Func(col)" 替换为已合成的 key
+// 例如: "Sum(amount) > 50" -> "__agg_Sum_amount > 50"
+// 同时配合 evaluateWithAggKeys 在过滤时还原。
+func rewriteHavingAggregates(s string, aggs []AggSpec) string {
+	// 简单替换：遍历所有已注册的 agg，替换其输出 key 的出现位置
+	// 为了安全，使用首尾边界确保是完整的 token
+	out := s
+	for _, agg := range aggs {
+		key := aggOutputKey(agg)
+		// 用一个特殊 key 替代，便于 ParseWhere 识别为列名
+		placeholder := "__agg_" + strings.ReplaceAll(key, "(", "_") + "_"
+		placeholder = strings.ReplaceAll(placeholder, ")", "_")
+		// 替换时确保是 word 边界
+		out = replaceToken(out, key, placeholder)
+	}
+	return out
+}
+
+// evaluateHavingWithAggs 评估带聚合重写后的 HAVING 表达式。
+// 将 __agg_*_ 占位符还原为合成 key 的实际值。
+func evaluateHavingWithAggs(expr Expression, row map[string]interface{}) bool {
+	// 自定义求值：递归遍历，将 ColumnExpr 名字映射到 row
+	val, err := evalExprForHaving(expr, row)
+	if err != nil {
+		return false
+	}
+	return toBoolForFilter(val)
+}
+
+func evalExprForHaving(expr Expression, row map[string]interface{}) (interface{}, error) {
+	switch v := expr.(type) {
+	case *ColumnExpr:
+		if val, ok := row[v.Name]; ok {
+			return val, nil
+		}
+		return nil, nil
+	case *LiteralExpr:
+		return v.Value, nil
+	case *BinaryExpr:
+		l, err := evalExprForHaving(v.Left, row)
+		if err != nil {
+			return nil, err
+		}
+		r, err := evalExprForHaving(v.Right, row)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinaryForHaving(v.Op, l, r)
+	case *UnaryExpr:
+		inner, err := evalExprForHaving(v.Operand, row)
+		if err != nil {
+			return nil, err
+		}
+		b := toBoolForFilter(inner)
+		if v.Op == "NOT" {
+			return !b, nil
+		}
+		return b, nil
+	}
+	return nil, fmt.Errorf("unsupported expr type")
+}
+
+func evalBinaryForHaving(op BinaryOp, left, right interface{}) (interface{}, error) {
+	switch op {
+	case OpEq:
+		return compareForFilter(left, right) == 0, nil
+	case OpNe:
+		return compareForFilter(left, right) != 0, nil
+	case OpLt:
+		return compareForFilter(left, right) < 0, nil
+	case OpLe:
+		return compareForFilter(left, right) <= 0, nil
+	case OpGt:
+		return compareForFilter(left, right) > 0, nil
+	case OpGe:
+		return compareForFilter(left, right) >= 0, nil
+	case OpAnd:
+		return toBoolForFilter(left) && toBoolForFilter(right), nil
+	case OpOr:
+		return toBoolForFilter(left) || toBoolForFilter(right), nil
+	}
+	return nil, fmt.Errorf("unsupported op: %s", op)
+}
+
+// replaceToken 替换整个 word 边界内的 token
+func replaceToken(s, old, new string) string {
+	// 找到所有 old 的位置，逐个检查是否为完整 token
+	out := ""
+	i := 0
+	for i < len(s) {
+		if i+len(old) <= len(s) && s[i:i+len(old)] == old {
+			// 检查 word 边界
+			before := i == 0 || !isWordByte(s[i-1])
+			after := i+len(old) == len(s) || !isWordByte(s[i+len(old)])
+			if before && after {
+				out += new
+				i += len(old)
+				continue
+			}
+		}
+		out += string(s[i])
+		i++
+	}
+	return out
+}
+
+// groupAndAggregate 按 groupBy 列分组，对每组应用 aggFuncs 聚合。
+// 如果无 groupBy 但有聚合：整个结果集当作一个组。
+// 输出列：groupBy 列 + 聚合结果列（key 为 "Function(col)" 或 alias）
+func groupAndAggregate(rows []map[string]interface{}, groupBy []string, aggFuncs []AggSpec) []map[string]interface{} {
+	// 无聚合且无 groupBy：原样返回
+	if len(aggFuncs) == 0 && len(groupBy) == 0 {
+		return rows
+	}
+
+	// 分组：以 groupBy 值的元组作为 key
+	groups := make(map[string][]map[string]interface{})
+	order := make([]string, 0) // 保留插入顺序
+	for _, row := range rows {
+		key := groupKey(row, groupBy)
+		if _, exists := groups[key]; !exists {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], row)
+	}
+
+	out := make([]map[string]interface{}, 0, len(groups))
+	for _, key := range order {
+		grp := groups[key]
+		// 构造新行：取第一行的 groupBy 列值
+		merged := make(map[string]interface{})
+		for _, col := range groupBy {
+			if len(grp) > 0 {
+				merged[col] = grp[0][col]
+			}
+		}
+		// 应用聚合
+		for _, agg := range aggFuncs {
+			val := computeAggregate(grp, agg.Function, agg.Column)
+			outKey := agg.Alias
+			if outKey == "" {
+				outKey = aggOutputKey(agg)
+			}
+			merged[outKey] = val
+			// 同时为 HAVING 重写提供占位 key（让 ParseWhere 视为合法列名）
+			placeholder := "__agg_" + strings.ReplaceAll(aggOutputKey(agg), "(", "_") + "_"
+			placeholder = strings.ReplaceAll(placeholder, ")", "_")
+			merged[placeholder] = val
+		}
+		// 即使无 aggFuncs，也要为 groupBy-only 的情况输出一行
+		if len(aggFuncs) == 0 && len(groupBy) > 0 {
+			// 已经合并了 groupBy 字段；OK
+		}
+		out = append(out, merged)
+	}
+	return out
+}
+
+// aggOutputKey 返回聚合函数在结果行中的默认 key
+func aggOutputKey(agg AggSpec) string {
+	if agg.Column == "" {
+		return fmt.Sprintf("%s()", agg.Function)
+	}
+	return fmt.Sprintf("%s(%s)", agg.Function, agg.Column)
+}
+
+// groupKey 为分组键构造字符串
+func groupKey(row map[string]interface{}, groupBy []string) string {
+	if len(groupBy) == 0 {
+		return "_all_"
+	}
+	parts := make([]string, len(groupBy))
+	for i, col := range groupBy {
+		parts[i] = fmt.Sprintf("%v", row[col])
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// computeAggregate 对一组行应用聚合函数
+func computeAggregate(group []map[string]interface{}, fn, col string) interface{} {
+	switch strings.ToLower(fn) {
+	case "count":
+		if col == "" {
+			return int64(len(group))
+		}
+		// COUNT(col): 统计 col 非 null 的行数
+		n := int64(0)
+		for _, r := range group {
+			if v, ok := r[col]; ok && v != nil {
+				n++
+			}
+		}
+		return n
+	case "sum":
+		var sum float64
+		for _, r := range group {
+			if v, ok := r[col]; ok && v != nil {
+				if f, ok := toFloat(v); ok {
+					sum += f
+				}
+			}
+		}
+		return sum
+	case "avg":
+		var sum float64
+		var n int64
+		for _, r := range group {
+			if v, ok := r[col]; ok && v != nil {
+				if f, ok := toFloat(v); ok {
+					sum += f
+					n++
+				}
+			}
+		}
+		if n == 0 {
+			return nil
+		}
+		return sum / float64(n)
+	case "min":
+		var minVal interface{}
+		for _, r := range group {
+			v, ok := r[col]
+			if !ok || v == nil {
+				continue
+			}
+			if minVal == nil || compareValues(v, minVal) < 0 {
+				minVal = v
+			}
+		}
+		return minVal
+	case "max":
+		var maxVal interface{}
+		for _, r := range group {
+			v, ok := r[col]
+			if !ok || v == nil {
+				continue
+			}
+			if maxVal == nil || compareValues(v, maxVal) > 0 {
+				maxVal = v
+			}
+		}
+		return maxVal
+	}
+	return nil
 }
 
 // projectColumns 投影出指定列（若列不存在则填 nil）

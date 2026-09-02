@@ -83,8 +83,30 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 			cols := make([]string, 0, len(o.Columns))
 			for _, c := range o.Columns {
 				cols = append(cols, exprToString(c))
+				// 检测聚合函数调用（FunctionCallExpression）
+				if fc, ok := c.(*parser.FunctionCallExpression); ok {
+					agg := AggSpec{
+						Function: fc.Name,
+						Column:   "",
+						Alias:    "",
+					}
+					if len(fc.Arguments) > 0 {
+						agg.Column = exprToString(fc.Arguments[0])
+					}
+					// 检查后续是否有 AS alias
+					_ = agg
+					qb = qb.AddAggregate(fc.Name, agg.Column, "")
+				}
 			}
 			qb = qb.Select(cols...)
+		case *parser.GroupByOperation:
+			cols := make([]string, 0, len(o.Columns))
+			for _, c := range o.Columns {
+				cols = append(cols, exprToString(c))
+			}
+			qb = qb.GroupBy(cols...)
+		case *parser.HavingOperation:
+			qb = qb.Having(exprToString(o.Condition))
 		case *parser.WhereOperation:
 			lastWhereExpr = o.Condition
 			where := exprToString(o.Condition)
