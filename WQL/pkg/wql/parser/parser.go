@@ -131,6 +131,10 @@ func (p *Parser) parseOperation() (Operation, error) {
 	case lexer.TOKEN_COUNT, lexer.TOKEN_SUM, lexer.TOKEN_AVG,
 		lexer.TOKEN_MIN, lexer.TOKEN_MAX:
 		return p.parseAggregateOperation()
+	case lexer.TOKEN_DISTINCT:
+		return p.parseDistinctOperation()
+	case lexer.TOKEN_BEGIN, lexer.TOKEN_COMMIT, lexer.TOKEN_ROLLBACK:
+		return p.parseTransactionOperation()
 	case lexer.TOKEN_UNION, lexer.TOKEN_UNION_ALL:
 		return p.parseUnionOperation()
 	case lexer.TOKEN_INTERSECT:
@@ -513,6 +517,39 @@ func (p *Parser) parseAggregateOperation() (*AggregateOperation, error) {
 }
 
 // parseUnionOperation 解析UNION操作
+// parseDistinctOperation 解析 DISTINCT 操作
+// 语法: .Distinct() 或 .Distinct(col1, col2, ...)
+func (p *Parser) parseDistinctOperation() (*DistinctOperation, error) {
+	p.nextToken() // 跳过 DISTINCT
+
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after Distinct, got %s", p.currentToken.Type)
+	}
+	p.nextToken()
+
+	cols := []Expression{}
+	for p.currentToken.Type != lexer.TOKEN_RPAREN {
+		expr, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, expr)
+		if p.currentToken.Type == lexer.TOKEN_COMMA {
+			p.nextToken()
+		}
+	}
+	p.nextToken() // 跳过 RPAREN
+
+	return &DistinctOperation{Columns: cols}, nil
+}
+
+// parseTransactionOperation 解析事务操作：BEGIN / COMMIT / ROLLBACK
+func (p *Parser) parseTransactionOperation() (*TransactionOperation, error) {
+	action := strings.ToUpper(p.currentToken.Value)
+	p.nextToken()
+	return &TransactionOperation{Action: action}, nil
+}
+
 func (p *Parser) parseUnionOperation() (*UnionOperation, error) {
 	all := p.currentToken.Type == lexer.TOKEN_UNION_ALL
 	p.nextToken()
@@ -600,6 +637,137 @@ func (p *Parser) parseBinaryExpression(precedence int) (Expression, error) {
 		return nil, err
 	}
 
+	// 后缀处理：IN / NOT IN / BETWEEN / LIKE / IS NULL / IS NOT NULL
+	for {
+		// NOT IN / NOT LIKE / NOT BETWEEN — 用 peekToken 预判避免回退
+		if p.currentToken.Type == lexer.TOKEN_NOT && isPostfixNotOp(p.peekToken.Type) {
+			p.nextToken() // 跳过 NOT
+			switch p.currentToken.Type {
+			case lexer.TOKEN_IN:
+				p.nextToken()
+				if p.currentToken.Type != lexer.TOKEN_LPAREN {
+					return nil, fmt.Errorf("expected '(' after NOT IN, got %s", p.currentToken.Type)
+				}
+				p.nextToken()
+				values := []Expression{}
+				for p.currentToken.Type != lexer.TOKEN_RPAREN {
+					v, err := p.parseExpression()
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, v)
+					if p.currentToken.Type == lexer.TOKEN_COMMA {
+						p.nextToken()
+					}
+				}
+				if p.currentToken.Type != lexer.TOKEN_RPAREN {
+					return nil, fmt.Errorf("expected ')' after NOT IN list, got %s", p.currentToken.Type)
+				}
+				p.nextToken()
+				left = &InExpression{Column: left, Values: values, Not: true}
+				continue
+			case lexer.TOKEN_LIKE:
+				p.nextToken()
+				pattern, err := p.parseExpression()
+				if err != nil {
+					return nil, err
+				}
+				left = &LikeExpression{Column: left, Pattern: pattern, Not: true}
+				continue
+			case lexer.TOKEN_BETWEEN:
+				p.nextToken()
+				low, err := p.parsePrimaryExpression()
+				if err != nil {
+					return nil, err
+				}
+				if p.currentToken.Type != lexer.TOKEN_AND {
+					return nil, fmt.Errorf("expected AND after NOT BETWEEN low, got %s", p.currentToken.Type)
+				}
+				p.nextToken()
+				high, err := p.parsePrimaryExpression()
+				if err != nil {
+					return nil, err
+				}
+				left = &BetweenExpression{Column: left, Low: low, High: high, Not: true}
+				continue
+			}
+		}
+
+		switch p.currentToken.Type {
+		case lexer.TOKEN_IN:
+			p.nextToken()
+			if p.currentToken.Type != lexer.TOKEN_LPAREN {
+				return nil, fmt.Errorf("expected '(' after IN, got %s", p.currentToken.Type)
+			}
+			p.nextToken()
+			values := []Expression{}
+			for p.currentToken.Type != lexer.TOKEN_RPAREN {
+				// 支持子查询作为 IN 的值
+				if p.currentToken.Type == lexer.TOKEN_DB {
+					sq, err := p.parseSubqueryStartingHere()
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, sq)
+				} else {
+					v, err := p.parseExpression()
+					if err != nil {
+						return nil, err
+					}
+					values = append(values, v)
+				}
+				if p.currentToken.Type == lexer.TOKEN_COMMA {
+					p.nextToken()
+				}
+			}
+			if p.currentToken.Type != lexer.TOKEN_RPAREN {
+				return nil, fmt.Errorf("expected ')' after IN list, got %s", p.currentToken.Type)
+			}
+			p.nextToken()
+			left = &InExpression{Column: left, Values: values, Not: false}
+			continue
+		case lexer.TOKEN_BETWEEN:
+			p.nextToken()
+			low, err := p.parsePrimaryExpression()
+			if err != nil {
+				return nil, err
+			}
+			if p.currentToken.Type != lexer.TOKEN_AND {
+				return nil, fmt.Errorf("expected AND after BETWEEN low, got %s", p.currentToken.Type)
+			}
+			p.nextToken()
+			high, err := p.parsePrimaryExpression()
+			if err != nil {
+				return nil, err
+			}
+			left = &BetweenExpression{Column: left, Low: low, High: high, Not: false}
+			continue
+		case lexer.TOKEN_LIKE:
+			p.nextToken()
+			pattern, err := p.parseExpression()
+			if err != nil {
+				return nil, err
+			}
+			left = &LikeExpression{Column: left, Pattern: pattern, Not: false}
+			continue
+		case lexer.TOKEN_IS:
+			p.nextToken()
+			notNull := false
+			if p.currentToken.Type == lexer.TOKEN_NOT {
+				notNull = true
+				p.nextToken()
+			}
+			if p.currentToken.Type != lexer.TOKEN_NULL {
+				return nil, fmt.Errorf("expected NULL after IS%s, got %s",
+					map[bool]string{true: " NOT", false: ""}[notNull], p.currentToken.Type)
+			}
+			p.nextToken()
+			left = &IsNullExpression{Column: left, Not: notNull}
+			continue
+		}
+		break
+	}
+
 	for {
 		op := p.currentToken
 		if !isBinaryOperator(op.Type) {
@@ -631,40 +799,31 @@ func (p *Parser) parseBinaryExpression(precedence int) (Expression, error) {
 // parsePrimaryExpression 解析基本表达式
 func (p *Parser) parsePrimaryExpression() (Expression, error) {
 	switch p.currentToken.Type {
-	case lexer.TOKEN_IDENTIFIER, lexer.TOKEN_COUNT, lexer.TOKEN_SUM, lexer.TOKEN_AVG, lexer.TOKEN_MIN, lexer.TOKEN_MAX,
-		lexer.TOKEN_JSON_EXTRACT, lexer.TOKEN_JSON_QUERY, lexer.TOKEN_JSON_VALUE:
-		// 支持带点的标识符，如 users.id
-		value := p.currentToken.Value
+	case lexer.TOKEN_NOT:
+		// 一元 NOT(...)
 		p.nextToken()
-
-		// 检查是否是函数调用：FunctionName(...)
-		if p.currentToken.Type == lexer.TOKEN_LPAREN {
-			return p.parseFunctionCall(value)
+		if p.currentToken.Type != lexer.TOKEN_LPAREN {
+			return nil, fmt.Errorf("expected '(' after NOT, got %s", p.currentToken.Type)
 		}
-
-		// 检查是否有点，如果有，则构造复合标识符
-		if p.currentToken.Type == lexer.TOKEN_DOT {
-			p.nextToken()
-			if p.currentToken.Type == lexer.TOKEN_IDENTIFIER {
-				// 复合标识符，如 users.id
-				compoundValue := value + "." + p.currentToken.Value
-				p.nextToken()
-				return &Identifier{Value: compoundValue}, nil
-			}
-		}
-
-		return &Identifier{Value: value}, nil
-	case lexer.TOKEN_INTEGER, lexer.TOKEN_FLOAT, lexer.TOKEN_STRING, lexer.TOKEN_BOOLEAN:
-		value := p.currentToken.Value
 		p.nextToken()
-		return &LiteralExpression{Value: value}, nil
+		expr, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		if p.currentToken.Type != lexer.TOKEN_RPAREN {
+			return nil, fmt.Errorf("expected ')' to close NOT, got %s", p.currentToken.Type)
+		}
+		p.nextToken()
+		return &UnaryExpression{Operator: "NOT", Operand: expr}, nil
 	case lexer.TOKEN_LPAREN:
+		// 可能是 IN (v1, v2, ...) / 子查询 / 括号表达式
 		p.nextToken()
-		// 检查是否是子查询：(db.Table(...)...)
+		// 子查询：(db.Table(...)...)
 		if p.currentToken.Type == lexer.TOKEN_DB {
 			return p.parseSubquery()
 		}
-		// 否则是普通的分组表达式
+		// 尝试解析为 IN 值列表：如果第一项是字面量/标识符，且后面有 ')' 紧跟 IS / 标识符，
+		// 那么这是分组表达式
 		expr, err := p.parseExpression()
 		if err != nil {
 			return nil, err
@@ -674,6 +833,38 @@ func (p *Parser) parsePrimaryExpression() (Expression, error) {
 		}
 		p.nextToken()
 		return expr, nil
+	case lexer.TOKEN_IDENTIFIER, lexer.TOKEN_COUNT, lexer.TOKEN_SUM, lexer.TOKEN_AVG, lexer.TOKEN_MIN, lexer.TOKEN_MAX,
+		lexer.TOKEN_JSON_EXTRACT, lexer.TOKEN_JSON_QUERY, lexer.TOKEN_JSON_VALUE:
+		// 支持带点的标识符，如 users.id
+		value := p.currentToken.Value
+		p.nextToken()
+
+		// 检查是否是函数调用：FunctionName(...)
+		if p.currentToken.Type == lexer.TOKEN_LPAREN {
+			// 可能是 IN / 普通函数 / subquery
+			return p.parseFunctionOrInCall(value)
+		}
+
+		// 检查是否有点，如果有，则构造复合标识符
+		if p.currentToken.Type == lexer.TOKEN_DOT {
+			p.nextToken()
+			if p.currentToken.Type == lexer.TOKEN_IDENTIFIER {
+				// 复合标识符，如 users.id
+				compoundValue := value + "." + p.currentToken.Value
+				p.nextToken()
+				// 可能还有方法调用
+				if p.currentToken.Type == lexer.TOKEN_LPAREN {
+					return p.parseFunctionOrInCall(compoundValue)
+				}
+				return &Identifier{Value: compoundValue}, nil
+			}
+		}
+
+		return &Identifier{Value: value}, nil
+	case lexer.TOKEN_INTEGER, lexer.TOKEN_FLOAT, lexer.TOKEN_STRING, lexer.TOKEN_BOOLEAN:
+		value := p.currentToken.Value
+		p.nextToken()
+		return &LiteralExpression{Value: value}, nil
 	default:
 		return nil, fmt.Errorf("unexpected token in expression: %s", p.currentToken.Type)
 	}
@@ -743,6 +934,57 @@ func (p *Parser) parseSubquery() (Expression, error) {
 	}, nil
 }
 
+// parseSubqueryStartingHere 期望 currentToken 是子查询的开头（如 db）。
+// 与 parseSubquery 不同：本函数期望 currentToken 已经是子查询的第一个 token，
+// 内部从头扫描整个子查询直到遇到匹配的右括号。
+func (p *Parser) parseSubqueryStartingHere() (Expression, error) {
+	var tokens []lexer.Token
+	parenLevel := 0
+
+	for {
+		// db.Table(t).Where(...).All() 这种 — 整体作为一个表达式，里面含 ( )
+		// 我们粗略收集到第一个未匹配的右括号或右方法
+		if p.currentToken.Type == lexer.TOKEN_LPAREN {
+			parenLevel++
+		} else if p.currentToken.Type == lexer.TOKEN_RPAREN {
+			if parenLevel == 0 {
+				break
+			}
+			parenLevel--
+		}
+		tokens = append(tokens, p.currentToken)
+		p.nextToken()
+		if p.currentToken.Type == lexer.TOKEN_EOF {
+			return nil, fmt.Errorf("unterminated subquery expression")
+		}
+	}
+
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("empty subquery")
+	}
+
+	// 重新构建子查询字符串
+	var subqueryBuilder strings.Builder
+	for i, tok := range tokens {
+		if i > 0 {
+			// 在 token 之间插入空格以便 lexer 正确切分
+			subqueryBuilder.WriteString(" ")
+		}
+		subqueryBuilder.WriteString(tok.Value)
+	}
+	subqueryStr := subqueryBuilder.String()
+
+	// 创建新的lexer和parser来解析子查询
+	subLexer := lexer.NewLexer(subqueryStr)
+	subParser := NewParser(subLexer)
+	subQuery, err := subParser.Parse()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse subquery: %v", err)
+	}
+
+	return &SubqueryExpression{Query: subQuery}, nil
+}
+
 // getOperatorPrecedence 获取运算符优先级
 func (p *Parser) getOperatorPrecedence(tokenType lexer.TokenType) int {
 	switch tokenType {
@@ -750,7 +992,7 @@ func (p *Parser) getOperatorPrecedence(tokenType lexer.TokenType) int {
 		return 1
 	case lexer.TOKEN_AND:
 		return 2
-	case lexer.TOKEN_EQ, lexer.TOKEN_NE, lexer.TOKEN_LT, lexer.TOKEN_LE, lexer.TOKEN_GT, lexer.TOKEN_GE, lexer.TOKEN_IN:
+	case lexer.TOKEN_EQ, lexer.TOKEN_NE, lexer.TOKEN_LT, lexer.TOKEN_LE, lexer.TOKEN_GT, lexer.TOKEN_GE:
 		return 3
 	case lexer.TOKEN_PLUS, lexer.TOKEN_MINUS:
 		return 4
@@ -769,14 +1011,53 @@ func isBinaryOperator(tokenType lexer.TokenType) bool {
 	case lexer.TOKEN_PLUS, lexer.TOKEN_MINUS, lexer.TOKEN_MULTIPLY, lexer.TOKEN_DIVIDE,
 		lexer.TOKEN_MODULO, lexer.TOKEN_POWER, lexer.TOKEN_EQ, lexer.TOKEN_NE,
 		lexer.TOKEN_LT, lexer.TOKEN_LE, lexer.TOKEN_GT, lexer.TOKEN_GE,
-		lexer.TOKEN_AND, lexer.TOKEN_OR, lexer.TOKEN_IN:
+		lexer.TOKEN_AND, lexer.TOKEN_OR:
 		return true
 	default:
 		return false
 	}
 }
 
+// isPostfixNotOp 报告 type 是否是 NOT 之后合法的后缀关键字（IN/LIKE/BETWEEN）
+func isPostfixNotOp(tokenType lexer.TokenType) bool {
+	switch tokenType {
+	case lexer.TOKEN_IN, lexer.TOKEN_LIKE, lexer.TOKEN_BETWEEN:
+		return true
+	}
+	return false
+}
+
 // parseFunctionCall 解析函数调用
+// parseFunctionOrInCall 解析类似 Name(...) 的调用：
+//   - 普通函数调用：Count(), Sum(amount), Avg(price)
+//   - IN 表达式：IN (1, 2, 3) — 但 IN 是关键字而非列名，因此由 parsePrimaryExpression 直接处理
+//   - 关键字调用：Count/Sum/Avg/Min/Max 走函数调用
+func (p *Parser) parseFunctionOrInCall(name string) (Expression, error) {
+	// 进入时 currentToken 已经在左括号
+	p.nextToken() // 跳过左括号
+
+	args := []Expression{}
+
+	for p.currentToken.Type != lexer.TOKEN_RPAREN {
+		arg, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+
+		if p.currentToken.Type == lexer.TOKEN_COMMA {
+			p.nextToken()
+		}
+	}
+
+	p.nextToken() // 跳过右括号
+
+	return &FunctionCallExpression{
+		Name:      name,
+		Arguments: args,
+	}, nil
+}
+
 func (p *Parser) parseFunctionCall(funcName string) (Expression, error) {
 	p.nextToken() // 跳过左括号
 

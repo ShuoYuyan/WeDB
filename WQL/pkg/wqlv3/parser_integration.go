@@ -124,6 +124,12 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 				col = exprToString(o.Column)
 			}
 			qb = qb.AddAggregate(o.Function, col, o.Alias)
+		case *parser.DistinctOperation:
+			cols := make([]string, len(o.Columns))
+			for i, c := range o.Columns {
+				cols[i] = exprToString(c)
+			}
+			qb = qb.Distinct(cols...)
 		case *parser.TakeOperation:
 			n, err := exprToInt(o.Count)
 			if err != nil {
@@ -236,7 +242,8 @@ func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (Query
 	for _, op := range ops {
 		switch op.(type) {
 		case *parser.InsertOperation, *parser.SetOperation, *parser.DeleteOperation,
-			*parser.CreateTableOperation, *parser.DropTableOperation:
+			*parser.CreateTableOperation, *parser.DropTableOperation,
+			*parser.TransactionOperation:
 			hasDML = true
 		}
 	}
@@ -296,6 +303,31 @@ func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (Query
 			case *parser.DropTableOperation:
 				if err := db.DropTable(qb.tableName); err != nil {
 					return result, err
+				}
+			case *parser.TransactionOperation:
+				switch o.Action {
+				case "BEGIN":
+					tx, err := db.adapter.BeginTransaction()
+					if err != nil {
+						return result, fmt.Errorf("BEGIN failed: %w", err)
+					}
+					db.currentTx = tx
+				case "COMMIT":
+					if db.currentTx == nil {
+						return result, fmt.Errorf("COMMIT without active transaction")
+					}
+					if err := db.currentTx.Commit(); err != nil {
+						return result, fmt.Errorf("COMMIT failed: %w", err)
+					}
+					db.currentTx = nil
+				case "ROLLBACK":
+					if db.currentTx == nil {
+						return result, fmt.Errorf("ROLLBACK without active transaction")
+					}
+					if err := db.currentTx.Rollback(); err != nil {
+						return result, fmt.Errorf("ROLLBACK failed: %w", err)
+					}
+					db.currentTx = nil
 				}
 			}
 		}
@@ -454,6 +486,44 @@ func astToString(e parser.Expression) string {
 			// 嵌套 AND 不需要额外括号
 		}
 		return fmt.Sprintf("(%s %s %s)", left, v.Operator, right)
+	case *parser.UnaryExpression:
+		if v.Operator == "NOT" {
+			return fmt.Sprintf("NOT(%s)", astToString(v.Operand))
+		}
+		return fmt.Sprintf("(%s %s)", v.Operator, astToString(v.Operand))
+	case *parser.InExpression:
+		col := astToString(v.Column)
+		values := make([]string, len(v.Values))
+		for i, val := range v.Values {
+			values[i] = astToString(val)
+		}
+		if v.Not {
+			return fmt.Sprintf("(%s NOT IN (%s))", col, joinArgs(values))
+		}
+		return fmt.Sprintf("(%s IN (%s))", col, joinArgs(values))
+	case *parser.LikeExpression:
+		col := astToString(v.Column)
+		pat := astToString(v.Pattern)
+		if v.Not {
+			return fmt.Sprintf("(%s NOT LIKE %s)", col, pat)
+		}
+		return fmt.Sprintf("(%s LIKE %s)", col, pat)
+	case *parser.BetweenExpression:
+		col := astToString(v.Column)
+		low := astToString(v.Low)
+		high := astToString(v.High)
+		if v.Not {
+			return fmt.Sprintf("(%s NOT BETWEEN %s AND %s)", col, low, high)
+		}
+		return fmt.Sprintf("(%s BETWEEN %s AND %s)", col, low, high)
+	case *parser.IsNullExpression:
+		col := astToString(v.Column)
+		if v.Not {
+			return fmt.Sprintf("(%s IS NOT NULL)", col)
+		}
+		return fmt.Sprintf("(%s IS NULL)", col)
+	case *parser.SubqueryExpression:
+		return v.String() // 由 SubqueryExpression 自己定义
 	default:
 		return e.String()
 	}
@@ -464,8 +534,17 @@ func astToString(e parser.Expression) string {
 func literalToString(v interface{}) string {
 	switch val := v.(type) {
 	case string:
-		// 字符串必须加双引号
-		// 需要转义内部的引号和反斜杠
+		// 检测数字/布尔/null 字符串（来自 lexer），不加引号
+		if val == "true" || val == "false" || val == "null" {
+			return val
+		}
+		if _, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return val
+		}
+		if _, err := strconv.ParseFloat(val, 64); err == nil {
+			return val
+		}
+		// 真正的字符串字面量才加引号
 		escaped := strings.ReplaceAll(val, `\`, `\\`)
 		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 		return fmt.Sprintf(`"%s"`, escaped)
@@ -476,6 +555,8 @@ func literalToString(v interface{}) string {
 		return "false"
 	case nil:
 		return "null"
+	case int, int32, int64, uint, uint32, uint64, float32, float64:
+		return fmt.Sprintf("%v", val)
 	default:
 		// 数字、布尔等直接用 %v
 		return fmt.Sprintf("%v", val)

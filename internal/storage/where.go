@@ -42,8 +42,13 @@ const (
 	OpGreaterThan  ComparisonOperator = ">"
 	OpGreaterEqual ComparisonOperator = ">="
 	OpLike         ComparisonOperator = "LIKE"
+	OpNotLike      ComparisonOperator = "NOT LIKE"
 	OpIn           ComparisonOperator = "IN"
 	OpNotIn        ComparisonOperator = "NOT IN"
+	OpBetween      ComparisonOperator = "BETWEEN"
+	OpNotBetween   ComparisonOperator = "NOT BETWEEN"
+	OpIsNull       ComparisonOperator = "IS NULL"
+	OpIsNotNull    ComparisonOperator = "IS NOT NULL"
 )
 
 // ParseWhereClause parses a WHERE clause string
@@ -120,25 +125,98 @@ func ParseWhereClauseWithValidation(where string, validColumns []string) (*Where
 	}, nil
 }
 
-// splitByOperator splits a string by operator, but not inside quotes or parentheses
+// splitByOperator splits a string by operator, but not inside quotes, parentheses,
+// or BETWEEN clauses (BETWEEN x AND y is one condition, not two).
 func splitByOperator(s, op string) []string {
 	var parts []string
 	var current strings.Builder
 	inParen := 0
+	inStr := byte(0)
+	// BETWEEN 状态机：当看到 "BETWEEN" 关键字时，set inBetween=true，
+	// 直到再次出现 AND 关键字（作为 BETWEEN 的连接）才 reset。
+	// 这里把 BETWEEN 视为一种"小括号"，将内层的 AND 吞下。
+	betweenDepth := 0
+
+	upper := strings.ToUpper(s)
 
 	for i := 0; i < len(s); i++ {
-		if s[i] == '(' {
+		c := s[i]
+		// 字符串字面量：吞下整个字面量
+		if inStr != 0 {
+			current.WriteByte(c)
+			if c == inStr {
+				inStr = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inStr = c
+			current.WriteByte(c)
+			// 吞到匹配的引号
+			i++
+			for i < len(s) {
+				ch := s[i]
+				current.WriteByte(ch)
+				if ch == '\\' && i+1 < len(s) {
+					current.WriteByte(s[i+1])
+					i += 2
+					continue
+				}
+				if ch == inStr {
+					inStr = 0
+					break
+				}
+				i++
+			}
+			continue
+		}
+		// 普通括号
+		if c == '(' {
 			inParen++
-			current.WriteByte(s[i])
-		} else if s[i] == ')' {
+			current.WriteByte(c)
+			continue
+		}
+		if c == ')' {
 			inParen--
-			current.WriteByte(s[i])
-		} else if inParen == 0 && i+len(op) <= len(s) && s[i:i+len(op)] == op {
-			parts = append(parts, strings.TrimSpace(current.String()))
-			current.Reset()
-			i += len(op) - 1
-		} else {
-			current.WriteByte(s[i])
+			current.WriteByte(c)
+			continue
+		}
+		// BETWEEN 关键字检测（顶层或括号外）
+		if inParen == 0 && betweenDepth == 0 {
+			// 检查是否是单词 "BETWEEN"
+			beforeOK := i == 0 || !isIdentByteForOp(s[i-1])
+			afterOK := i+7 >= len(s) || !isIdentByteForOp(s[i+7])
+			if beforeOK && afterOK && i+7 <= len(s) && upper[i:i+7] == "BETWEEN" {
+				betweenDepth = 1
+				current.WriteString("BETWEEN")
+				i += 6
+				continue
+			}
+		}
+		// 顶层 AND/OR 切分
+		if inParen == 0 && betweenDepth == 0 && i+len(op) <= len(s) && upper[i:i+len(op)] == op {
+			// 检查单词边界
+			beforeOK := i == 0 || !isIdentByteForOp(s[i-1])
+			afterOK := i+len(op) == len(s) || !isIdentByteForOp(s[i+len(op)])
+			if beforeOK && afterOK {
+				parts = append(parts, strings.TrimSpace(current.String()))
+				current.Reset()
+				i += len(op) - 1
+				continue
+			}
+		}
+		current.WriteByte(c)
+		// BETWEEN 内部遇到 AND：消耗它（不切分）
+		if betweenDepth > 0 && inParen == 0 && i+3 < len(s) && upper[i+1:i+4] == "AND" {
+			// 当前字符 c 已写入；下一个位置开始的 3 字符是 AND
+			// 验证 AND 单词边界
+			after := i + 4
+			if after == len(s) || !isIdentByteForOp(s[after]) {
+				current.WriteString("AND")
+				i += 3
+				// BETWEEN 只消耗一个 AND 即可
+				betweenDepth = 0
+			}
 		}
 	}
 
@@ -182,6 +260,44 @@ func isOuterParenPair(cond string) bool {
 // parseSingleCondition parses a single condition like "age > 25"
 func parseSingleCondition(cond string, validColumns []string) (*Condition, error) {
 	cond = strings.TrimSpace(cond)
+	// 处理 NOT(...) 一元否定：将 NOT(cond) 视为对 cond 取反
+	// 通过两个子条件 + 顶层 OR 模拟? 简化做法：把 NOT 吸收到内部
+	upper := strings.ToUpper(cond)
+	if strings.HasPrefix(upper, "NOT(") && strings.HasSuffix(cond, ")") {
+		// 提取 NOT 内的表达式
+		inner := strings.TrimSpace(cond[4 : len(cond)-1])
+		// 解析内层条件
+		innerCond, err := parseSingleCondition(inner, validColumns)
+		if err != nil {
+			return nil, err
+		}
+		// NOT 语义：把内层算符取反
+		switch innerCond.Operator {
+		case OpEqual:
+			innerCond.Operator = OpNotEqual
+		case OpNotEqual:
+			innerCond.Operator = OpEqual
+		case OpLike:
+			innerCond.Operator = OpNotLike
+		case OpNotLike:
+			innerCond.Operator = OpLike
+		case OpIn:
+			innerCond.Operator = OpNotIn
+		case OpNotIn:
+			innerCond.Operator = OpIn
+		case OpBetween:
+			innerCond.Operator = OpNotBetween
+		case OpNotBetween:
+			innerCond.Operator = OpBetween
+		case OpIsNull:
+			innerCond.Operator = OpIsNotNull
+		case OpIsNotNull:
+			innerCond.Operator = OpIsNull
+		default:
+			return nil, fmt.Errorf("NOT cannot be applied to operator %s", innerCond.Operator)
+		}
+		return innerCond, nil
+	}
 	// 去除外层包裹的圆括号（WQL 生成的条件常带括号）
 	for len(cond) >= 2 && cond[0] == '(' && cond[len(cond)-1] == ')' {
 		// 确保括号是配对的（避免剥离字符串字面量内的括号）
@@ -191,55 +307,159 @@ func parseSingleCondition(cond string, validColumns []string) (*Condition, error
 			break
 		}
 	}
+	// 如果 paren-strip 后又变成 NOT(...)（说明原来是 ((NOT(...)))，重新处理
+	upper = strings.ToUpper(cond)
+	if strings.HasPrefix(upper, "NOT(") && strings.HasSuffix(cond, ")") {
+		return parseSingleCondition(cond, validColumns) // 复用上面的 NOT 逻辑
+	}
 
 	// Try to parse each operator
+	// 顺序：多字符算符先于短字符（避免 "=" 抢先匹配 "IN" 内的 "="）
+	// 特殊算符：IS NULL / IS NOT NULL / BETWEEN 是单词边界敏感的
 	operators := []ComparisonOperator{
+		OpIsNotNull,
+		OpIsNull,
+		OpNotBetween,
+		OpNotIn,
+		OpNotLike,
+		OpBetween,
 		OpNotEqual,
 		OpLessEqual,
 		OpGreaterEqual,
-		OpNotIn,
 		OpLessThan,
 		OpGreaterThan,
-		OpEqual,
 		OpIn,
 		OpLike,
+		OpEqual,
 	}
 
 	for _, op := range operators {
 		opStr := string(op)
-		idx := strings.Index(strings.ToUpper(cond), opStr)
-		if idx != -1 {
-			// Split by operator
-			left := strings.TrimSpace(cond[:idx])
-			right := strings.TrimSpace(cond[idx+len(opStr):])
+		idx := findOperatorIndex(cond, opStr)
+		if idx < 0 {
+			continue
+		}
 
-			// 验证列名
+		// IS NULL / IS NOT NULL 特殊处理
+		if op == OpIsNull || op == OpIsNotNull {
+			col := strings.TrimSpace(cond[:idx])
+			if col == "" {
+				continue
+			}
 			if validColumns != nil {
-				if err := util.ValidateColumnNameInTable(left, validColumns); err != nil {
+				if err := util.ValidateColumnNameInTable(col, validColumns); err != nil {
 					return nil, err
 				}
 			} else {
-				// 如果没有提供validColumns，至少验证列名格式
-				if err := util.ValidateColumnName(left); err != nil {
+				if err := util.ValidateColumnName(col); err != nil {
 					return nil, err
 				}
 			}
-
-			// Parse value
-			value, err := parseValue(right)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse value '%s': %w", right, err)
-			}
-
-			return &Condition{
-				Column:   left,
-				Operator: op,
-				Value:    value,
-			}, nil
+			return &Condition{Column: col, Operator: op, Value: nil}, nil
 		}
+
+		// BETWEEN 特殊处理：col BETWEEN low AND high
+		if op == OpBetween || op == OpNotBetween {
+			col := strings.TrimSpace(cond[:idx])
+			if col == "" {
+				continue
+			}
+			rest := strings.TrimSpace(cond[idx+len(opStr):])
+			// 期望格式：low AND high
+			andIdx := strings.Index(strings.ToUpper(rest), " AND ")
+			if andIdx < 0 {
+				// 不是合法 BETWEEN，跳过
+				continue
+			}
+			lowStr := strings.TrimSpace(rest[:andIdx])
+			highStr := strings.TrimSpace(rest[andIdx+5:])
+			low, err := parseValue(lowStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse BETWEEN low '%s': %w", lowStr, err)
+			}
+			high, err := parseValue(highStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse BETWEEN high '%s': %w", highStr, err)
+			}
+			if validColumns != nil {
+				if err := util.ValidateColumnNameInTable(col, validColumns); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := util.ValidateColumnName(col); err != nil {
+					return nil, err
+				}
+			}
+			return &Condition{Column: col, Operator: op, Value: []interface{}{low, high}}, nil
+		}
+
+		// 验证列名
+		left := strings.TrimSpace(cond[:idx])
+		right := strings.TrimSpace(cond[idx+len(opStr):])
+		if validColumns != nil {
+			if err := util.ValidateColumnNameInTable(left, validColumns); err != nil {
+				return nil, err
+			}
+		} else {
+			// 如果没有提供validColumns，至少验证列名格式
+			if err := util.ValidateColumnName(left); err != nil {
+				return nil, err
+			}
+		}
+
+		// Parse value
+		value, err := parseValue(right)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse value '%s': %w", right, err)
+		}
+
+		return &Condition{
+			Column:   left,
+			Operator: op,
+			Value:    value,
+		}, nil
 	}
 
 	return nil, fmt.Errorf("invalid condition: %s", cond)
+}
+
+// findOperatorIndex 找到 opStr 在 cond 中作为算符（而非子串）的位置。
+// 算符必须以单词边界开头：要么 cond 开头，要么前面不是字母/数字/下划线。
+// 算符必须以单词边界结束：要么 cond 结尾，要么后面不是字母/数字/下划线。
+func findOperatorIndex(cond, opStr string) int {
+	upper := strings.ToUpper(cond)
+	idx := 0
+	for {
+		i := strings.Index(upper[idx:], opStr)
+		if i < 0 {
+			return -1
+		}
+		absIdx := idx + i
+		// 检查前边界
+		if absIdx > 0 {
+			prev := cond[absIdx-1]
+			if isIdentByteForOp(prev) {
+				idx = absIdx + 1
+				continue
+			}
+		}
+		// 检查后边界
+		endIdx := absIdx + len(opStr)
+		if endIdx < len(cond) {
+			next := cond[endIdx]
+			if isIdentByteForOp(next) {
+				idx = absIdx + 1
+				continue
+			}
+		}
+		return absIdx
+	}
+}
+
+// isIdentByteForOp 报告 c 是否是标识符字符（用于算符边界判断）
+func isIdentByteForOp(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_'
 }
 
 // parseValue parses a value string into appropriate type
@@ -362,6 +582,30 @@ func evaluateCondition(cond *Condition, row map[string]interface{}) (bool, error
 		return checkIn(rowValue, cond.Value), nil
 	case OpNotIn:
 		return !checkIn(rowValue, cond.Value), nil
+	case OpNotLike:
+		result, err := matchLike(rowValue, cond.Value)
+		if err != nil {
+			return false, err
+		}
+		return !result, nil
+	case OpBetween, OpNotBetween:
+		bounds, ok := cond.Value.([]interface{})
+		if !ok || len(bounds) != 2 {
+			return false, fmt.Errorf("BETWEEN expects [low, high] value pair")
+		}
+		low, high := bounds[0], bounds[1]
+		// low <= val <= high
+		geLow := !compareLessThan(rowValue, low)        // rowValue >= low
+		leHigh := compareLessThan(rowValue, high) || compareEqual(rowValue, high)
+		inRange := geLow && leHigh
+		if cond.Operator == OpNotBetween {
+			return !inRange, nil
+		}
+		return inRange, nil
+	case OpIsNull:
+		return rowValue == nil, nil
+	case OpIsNotNull:
+		return rowValue != nil, nil
 	default:
 		return false, fmt.Errorf("unsupported operator: %s", cond.Operator)
 	}

@@ -257,21 +257,41 @@ func (w *WeDBAdapter) BeginTx(ctx context.Context, opts *api.TxOptions) (Transac
 	if err != nil {
 		return nil, err
 	}
-	return &weDBTx{tx: tx}, nil
+	return &weDBTx{tx: tx, active: true}, nil
+}
+
+// BeginTransaction 开始默认事务（满足 wqlv3.Adapter 接口）
+func (w *WeDBAdapter) BeginTransaction() (Transaction, error) {
+	return w.BeginTx(context.Background(), nil)
 }
 
 // Transaction 事务接口
 type Transaction interface {
 	Commit() error
 	Rollback() error
+	IsActive() bool
 }
 
 type weDBTx struct {
-	tx api.Transaction
+	tx     api.Transaction
+	active bool
 }
 
-func (t *weDBTx) Commit() error   { return t.tx.Commit() }
-func (t *weDBTx) Rollback() error { return t.tx.Rollback() }
+func (t *weDBTx) Commit() error {
+	if !t.active {
+		return nil
+	}
+	t.active = false
+	return t.tx.Commit()
+}
+func (t *weDBTx) Rollback() error {
+	if !t.active {
+		return nil
+	}
+	t.active = false
+	return t.tx.Rollback()
+}
+func (t *weDBTx) IsActive() bool { return t.active }
 
 // ===== 表达式引擎（内部 WHERE 解析辅助） =====
 

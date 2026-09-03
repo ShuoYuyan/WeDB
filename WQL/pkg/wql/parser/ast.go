@@ -526,3 +526,111 @@ func (s *SubqueryExpression) String() string {
 }
 
 func (s *SubqueryExpression) expressionNode() {}
+
+// UnaryExpression 一元表达式：NOT(...)
+type UnaryExpression struct {
+	Operator string // "NOT"
+	Operand  Expression
+}
+
+func (u *UnaryExpression) String() string {
+	return fmt.Sprintf("%s(%s)", u.Operator, u.Operand)
+}
+
+func (u *UnaryExpression) expressionNode() {}
+
+// InExpression IN 表达式：col IN (v1, v2, v3)
+type InExpression struct {
+	Column Expression
+	Values []Expression
+	Not    bool // true = NOT IN
+}
+
+func (e *InExpression) String() string {
+	values := make([]string, len(e.Values))
+	for i, v := range e.Values {
+		values[i] = v.String()
+	}
+	if e.Not {
+		return fmt.Sprintf("(%s NOT IN (%s))", e.Column, fmt.Sprintf("%v", values))
+	}
+	return fmt.Sprintf("(%s IN (%s))", e.Column, fmt.Sprintf("%v", values))
+}
+
+func (e *InExpression) expressionNode() {}
+
+// LikeExpression LIKE 表达式：col LIKE "pattern"
+type LikeExpression struct {
+	Column   Expression
+	Pattern  Expression
+	Not      bool // true = NOT LIKE
+	CaseSensitive bool
+}
+
+func (e *LikeExpression) String() string {
+	if e.Not {
+		return fmt.Sprintf("(%s NOT LIKE %s)", e.Column, e.Pattern)
+	}
+	return fmt.Sprintf("(%s LIKE %s)", e.Column, e.Pattern)
+}
+
+func (e *LikeExpression) expressionNode() {}
+
+// BetweenExpression BETWEEN 表达式：col BETWEEN low AND high
+type BetweenExpression struct {
+	Column Expression
+	Low    Expression
+	High   Expression
+	Not    bool
+}
+
+func (e *BetweenExpression) String() string {
+	if e.Not {
+		return fmt.Sprintf("(%s NOT BETWEEN %s AND %s)", e.Column, e.Low, e.High)
+	}
+	return fmt.Sprintf("(%s BETWEEN %s AND %s)", e.Column, e.Low, e.High)
+}
+
+func (e *BetweenExpression) expressionNode() {}
+
+// IsNullExpression IS NULL / IS NOT NULL 表达式
+type IsNullExpression struct {
+	Column Expression
+	Not    bool
+}
+
+func (e *IsNullExpression) String() string {
+	if e.Not {
+		return fmt.Sprintf("(%s IS NOT NULL)", e.Column)
+	}
+	return fmt.Sprintf("(%s IS NULL)", e.Column)
+}
+
+func (e *IsNullExpression) expressionNode() {}
+
+// DistinctOperation DISTINCT 去重操作
+type DistinctOperation struct {
+	Columns []Expression
+}
+
+func (d *DistinctOperation) String() string {
+	cols := make([]string, len(d.Columns))
+	for i, c := range d.Columns {
+		cols[i] = c.String()
+	}
+	return fmt.Sprintf("Distinct(%s)", fmt.Sprintf("%v", cols))
+}
+
+func (d *DistinctOperation) operationNode() {}
+
+// TransactionOperation 事务操作：BEGIN / COMMIT / ROLLBACK
+type TransactionOperation struct {
+	Action string // "BEGIN", "COMMIT", "ROLLBACK"
+}
+
+func (t *TransactionOperation) String() string {
+	return t.Action
+}
+
+func (t *TransactionOperation) operationNode() {}
+func (t *TransactionOperation) dmlNode()      {}

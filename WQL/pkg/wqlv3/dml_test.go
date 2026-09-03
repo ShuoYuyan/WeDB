@@ -77,7 +77,7 @@ func (m *mockAdapter) ScanTableWithOptions(tableName string, opts *QueryOptions)
 
 	// WHERE
 	if opts != nil && opts.Where != "" {
-		rows = filterRows(rows, opts.Where)
+		rows = filterByConditionWithNewOps(rows, opts.Where)
 	}
 	// ORDER BY
 	if opts != nil && len(opts.OrderBy) > 0 {
@@ -351,11 +351,25 @@ func (m *mockAdapter) Avg(tableName, column, condition string) (float64, error) 
 	return sum / float64(len(filtered)), nil
 }
 
+// BeginTransaction mock 实现
+func (m *mockAdapter) BeginTransaction() (Transaction, error) {
+	return &mockTx{active: true}, nil
+}
+
+type mockTx struct {
+	active bool
+}
+
+func (t *mockTx) Commit() error   { t.active = false; return nil }
+func (t *mockTx) Rollback() error { t.active = false; return nil }
+func (t *mockTx) IsActive() bool  { return t.active }
+
 func filterByCondition(rows []map[string]interface{}, condition string) ([]map[string]interface{}, error) {
 	if condition == "" {
 		return rows, nil
 	}
-	return filterRows(rows, condition), nil
+	// 使用 storage 风格的 WHERE 解析器（支持 IN/LIKE/BETWEEN/IS NULL/NOT）
+	return filterByConditionWithNewOps(rows, condition), nil
 }
 
 type mockError struct{ msg string }

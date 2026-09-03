@@ -23,11 +23,18 @@ import (
 // Database 是 WQL 的入口
 type Database struct {
 	adapter Adapter
+	// currentTx 当前事务（如有）；后续 DML 自动在事务中执行
+	currentTx Transaction
 }
 
 // NewDatabase 创建 WQL 数据库
 func NewDatabase(a Adapter) *Database {
 	return &Database{adapter: a}
+}
+
+// CurrentTransaction 返回当前活跃事务
+func (d *Database) CurrentTransaction() Transaction {
+	return d.currentTx
 }
 
 // QueryOptions 查询选项（用于下推到存储引擎）
@@ -75,6 +82,9 @@ type Adapter interface {
 	Max(tableName, column, condition string) (interface{}, error)
 	Sum(tableName, column, condition string) (float64, error)
 	Avg(tableName, column, condition string) (float64, error)
+
+	// 事务
+	BeginTransaction() (Transaction, error)
 }
 
 // TableSchema 简化的表结构（用于 CLI 显示）
@@ -321,7 +331,10 @@ type QueryBuilder struct {
 	groupBy   []string   // GROUP BY 列
 	having    string     // HAVING 条件（已格式化）
 	aggFuncs  []AggSpec  // 聚合函数规格（仅在有 GROUP BY 时使用）
+	distinct  []string   // DISTINCT 列（空 = 全部去重）
 }
+
+// 事务接口见 wedb_adapter.go 中的 Transaction 定义
 
 // AggSpec 聚合函数规格
 type AggSpec struct {
@@ -359,6 +372,12 @@ func (qb *QueryBuilder) Skip(n int64) *QueryBuilder {
 // Take 设置最大返回行数
 func (qb *QueryBuilder) Take(n int64) *QueryBuilder {
 	qb.takeN = n
+	return qb
+}
+
+// Distinct 指定去重列（空参数表示对所有列去重）
+func (qb *QueryBuilder) Distinct(cols ...string) *QueryBuilder {
+	qb.distinct = cols
 	return qb
 }
 
@@ -524,6 +543,11 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 	// 第6步: SELECT 列投影
 	if len(qb.selects) > 0 {
 		rows = projectColumns(rows, qb.selects)
+	}
+
+	// 第6.5步: DISTINCT 去重（qb.distinct 字段为非 nil 即启用；空列表示对所有列去重）
+	if qb.distinct != nil {
+		rows = distinctRows(rows, qb.distinct)
 	}
 
 	// 第7步: ORDER BY 排序（仅当未下推时）
@@ -805,9 +829,52 @@ func computeAggregate(group []map[string]interface{}, fn, col string) interface{
 	return nil
 }
 
-// projectColumns 投影出指定列（若列不存在则填 nil）
-func projectColumns(rows []map[string]interface{}, cols []string) []map[string]interface{} {
+// distinctRows 按指定列（或全部列）去重，保留首次出现的行
+func distinctRows(rows []map[string]interface{}, cols []string) []map[string]interface{} {
+	seen := make(map[string]bool)
 	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		key := rowKey(row, cols)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, row)
+	}
+	return out
+}
+
+// rowKey 构造行的去重 key：cols 为空时取所有列
+func rowKey(row map[string]interface{}, cols []string) string {
+	if len(cols) == 0 {
+		// 取所有列（按键名排序以保证稳定）
+		keys := make([]string, 0, len(row))
+		for k := range row {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, row[k]))
+		}
+		return strings.Join(parts, "\x00")
+	}
+	parts := make([]string, 0, len(cols))
+	for _, c := range cols {
+		// 支持 table.col 短名查找
+		v, ok := row[c]
+		if !ok {
+			if idx := strings.LastIndex(c, "."); idx >= 0 {
+				v, ok = row[c[idx+1:]]
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%v", v))
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// projectColumns 投影出指定列（若列不存在则填 nil）
+func projectColumns(rows []map[string]interface{}, cols []string) []map[string]interface{} {	out := make([]map[string]interface{}, 0, len(rows))
 	for _, row := range rows {
 		proj := make(map[string]interface{}, len(cols))
 		for _, c := range cols {

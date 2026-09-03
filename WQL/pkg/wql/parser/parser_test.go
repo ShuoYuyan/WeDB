@@ -69,16 +69,25 @@ func TestParseSubquery(t *testing.T) {
 		t.Fatalf("first operation is not WhereOperation")
 	}
 
-	// 检查Condition是否是BinaryExpression
-	binaryExpr, ok := whereOp.Condition.(*BinaryExpression)
+	// 检查Condition是否是 InExpression（新的 IN 语法）
+	inExpr, ok := whereOp.Condition.(*InExpression)
 	if !ok {
-		t.Fatalf("Where condition is not BinaryExpression")
+		// 兼容旧式 BinaryExpression
+		if be, ok2 := whereOp.Condition.(*BinaryExpression); ok2 {
+			if _, ok3 := be.Right.(*SubqueryExpression); ok3 {
+				return // OK 旧式
+			}
+		}
+		t.Fatalf("Where condition is not InExpression or BinaryExpression with subquery, got %T", whereOp.Condition)
 	}
 
-	// 检查Right是否是SubqueryExpression
-	subquery, ok := binaryExpr.Right.(*SubqueryExpression)
+	// 检查 InExpression 的 Values 是否包含 SubqueryExpression
+	if len(inExpr.Values) == 0 {
+		t.Fatal("InExpression.Values is empty")
+	}
+	subquery, ok := inExpr.Values[0].(*SubqueryExpression)
 	if !ok {
-		t.Fatalf("Right side of binary expression is not SubqueryExpression, got %T", binaryExpr.Right)
+		t.Fatalf("First InExpression value is not SubqueryExpression, got %T", inExpr.Values[0])
 	}
 
 	if subquery.Query == nil {
