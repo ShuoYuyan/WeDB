@@ -728,12 +728,15 @@ func (p *Parser) parseBinaryExpression(precedence int) (Expression, error) {
 				left = &InExpression{Column: left, Values: values, Not: true}
 				continue
 			case lexer.TOKEN_LIKE:
-				p.nextToken()
-				pattern, err := p.parseExpression()
-				if err != nil {
-					return nil, err
-				}
-				left = &LikeExpression{Column: left, Pattern: pattern, Not: true}
+				// 不要 p.nextToken()：保留 currentToken=LIKE, peekToken=下一 token
+				// 把 peekToken 当作 pattern 的开始；如果 lexer 当前位置是 % 或 _，
+				// 就把它们 append 到 pattern。
+				patTok := p.peekToken
+				// 检查当前 lexer 位置，看能否扩展 patTok 的 value
+				p.lexer.ExtendIdentifierValue(&patTok)
+				p.nextToken() // 现在 currentToken = patTok
+				p.nextToken() // 跳过 pattern
+				left = &LikeExpression{Column: left, Pattern: &Identifier{Value: patTok.Value}, Not: true}
 				continue
 			case lexer.TOKEN_BETWEEN:
 				p.nextToken()
@@ -804,12 +807,11 @@ func (p *Parser) parseBinaryExpression(precedence int) (Expression, error) {
 			left = &BetweenExpression{Column: left, Low: low, High: high, Not: false}
 			continue
 		case lexer.TOKEN_LIKE:
+			patTok := p.peekToken
+			p.lexer.ExtendIdentifierValue(&patTok)
 			p.nextToken()
-			pattern, err := p.parseExpression()
-			if err != nil {
-				return nil, err
-			}
-			left = &LikeExpression{Column: left, Pattern: pattern, Not: false}
+			p.nextToken()
+			left = &LikeExpression{Column: left, Pattern: &Identifier{Value: patTok.Value}, Not: false}
 			continue
 		case lexer.TOKEN_IS:
 			p.nextToken()
@@ -1145,6 +1147,21 @@ func (p *Parser) parseFunctionCall(funcName string) (Expression, error) {
 }
 
 // nextToken 读取下一个Token
+// parseLikePattern 解析 LIKE 模式（无双引号：直接读取 a% / _x% 等）
+// 返回模式字符串。模式中可以包含字母、数字、_、%。
+func (p *Parser) parseLikePattern() (string, error) {
+	if p.currentToken.Type == lexer.TOKEN_STRING {
+		v := p.currentToken.Value
+		p.nextToken()
+		return v, nil
+	}
+	// 当前 token 应为标识符（包含 % 和 _）
+	if p.currentToken.Type != lexer.TOKEN_IDENTIFIER {
+		return "", fmt.Errorf("expected LIKE pattern, got %s", p.currentToken.Type)
+	}
+	return p.currentToken.Value, nil
+}
+
 func (p *Parser) nextToken() {
 	p.currentToken = p.peekToken
 	p.peekToken = p.lexer.NextToken()

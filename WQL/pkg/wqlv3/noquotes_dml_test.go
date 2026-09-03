@@ -14,15 +14,15 @@ func TestNoQuotesDMLInsert(t *testing.T) {
 	}{
 		{
 			name:  "Insert - 对象字面量形式",
-			input: `db.Table(users).Insert({id: 1, name: "alice", age: 30}).Execute()`,
+			input: `db.Table(users).Insert({id: 1, name: alice, age: 30}).Execute()`,
 		},
 		{
 			name:  "Insert - 列值对形式",
-			input: `db.Table(users).Insert(id, 2, name, "bob", age, 25).Execute()`,
+			input: `db.Table(users).Insert(id, 2, name, bob, age, 25).Execute()`,
 		},
 		{
 			name:  "Insert - 省略 Execute() 终结",
-			input: `db.Table(users).Insert({id: 3, name: "carol", age: 40})`,
+			input: `db.Table(users).Insert({id: 3, name: carol, age: 40})`,
 		},
 	}
 
@@ -123,10 +123,10 @@ func TestNoQuotesFullDMLCycle(t *testing.T) {
 	}
 
 	// INSERT
-	if _, err := EvaluateQueryNoQuotes(db, `db.Table(orders).Insert({id: 1, product: "apple", qty: 10}).Execute()`); err != nil {
+	if _, err := EvaluateQueryNoQuotes(db, `db.Table(orders).Insert({id: 1, product: apple, qty: 10}).Execute()`); err != nil {
 		t.Fatalf("INSERT failed: %v", err)
 	}
-	if _, err := EvaluateQueryNoQuotes(db, `db.Table(orders).Insert({id: 2, product: "banana", qty: 20}).Execute()`); err != nil {
+	if _, err := EvaluateQueryNoQuotes(db, `db.Table(orders).Insert({id: 2, product: banana, qty: 20}).Execute()`); err != nil {
 		t.Fatalf("INSERT 2 failed: %v", err)
 	}
 
@@ -137,7 +137,7 @@ func TestNoQuotesFullDMLCycle(t *testing.T) {
 	}
 
 	// UPDATE
-	if _, err := EvaluateQueryNoQuotes(db, `db.Table(orders).Set(qty, 100).Where(product = "apple").Execute()`); err != nil {
+	if _, err := EvaluateQueryNoQuotes(db, `db.Table(orders).Set(qty, 100).Where(product = apple).Execute()`); err != nil {
 		t.Fatalf("UPDATE failed: %v", err)
 	}
 	row, _ := db.Table("orders").Where("product = 'apple'").First()
@@ -168,7 +168,7 @@ func TestParserASTInsert(t *testing.T) {
 	// 通过 EvaluateQueryNoQuotes 间接验证（AST 在 buildQueryBuilder 中被消费）
 	db, m := setupTestDB(t)
 
-	input := `db.Table(users).Insert({id: 99, name: "tester", age: 18}).Execute()`
+	input := `db.Table(users).Insert({id: 99, name: tester, age: 18}).Execute()`
 	_, err := EvaluateQueryNoQuotes(db, input)
 	if err != nil {
 		t.Fatalf("Parse/Execute failed: %v", err)

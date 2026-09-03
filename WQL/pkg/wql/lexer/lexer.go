@@ -181,6 +181,47 @@ func (l *Lexer) readIdentifier() string {
 	return l.input[position:l.position]
 }
 
+// readLikePattern 读取 LIKE 模式（无双引号设计：直接读取直到空白/括号）
+// 支持字符：字母、数字、_、%
+func (l *Lexer) readLikePattern() string {
+	position := l.position
+	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' || l.ch == '%' {
+		l.readChar()
+	}
+	return l.input[position:l.position]
+}
+
+// readPatternToken 读取一个可能是 LIKE 模式的 token；
+// 如果当前字符是字母/数字/_/%，则读取完整的 LIKE 模式。
+// 否则按常规 NextToken。
+// 这个函数专门给 parser 在 LIKE 之后使用。
+func (l *Lexer) readPatternToken() Token {
+	if isLetter(l.ch) || l.ch == '_' {
+		ident := l.readLikePattern()
+		// LIKE 模式总是视为 IDENTIFIER
+		return Token{Type: TOKEN_IDENTIFIER, Value: ident, Line: l.line, Column: l.column - len(ident)}
+	}
+	return l.NextToken()
+}
+
+// ReadPatternToken 是 readPatternToken 的公开版本，供 parser 在 LIKE 之后使用。
+func (l *Lexer) ReadPatternToken() Token {
+	return l.readPatternToken()
+}
+
+// ExtendIdentifierValue 扩展当前 lexer position：如果当前位置是 % 或 _，
+// 把它们加到 token 的值中（用于 LIKE 模式中 currentToken 是 a 而 peekToken 是 % 的情况）。
+// 返回 true 表示扩展了字符。
+func (l *Lexer) ExtendIdentifierValue(tok *Token) bool {
+	extended := false
+	for l.ch == '%' || l.ch == '_' {
+		tok.Value += string(l.ch)
+		l.readChar()
+		extended = true
+	}
+	return extended
+}
+
 // readNumber 读取数字
 func (l *Lexer) readNumber() Token {
 	position := l.position

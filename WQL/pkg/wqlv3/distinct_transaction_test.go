@@ -86,7 +86,7 @@ func TestTransactionBeginCommit(t *testing.T) {
 	}
 
 	// INSERT
-	_, err = EvaluateQueryNoQuotes(db, `db.Table(users).Insert({id: 1, name: "alice"}).Execute()`)
+	_, err = EvaluateQueryNoQuotes(db, `db.Table(users).Insert({id: 1, name: alice}).Execute()`)
 	if err != nil {
 		t.Fatalf("Insert in tx failed: %v", err)
 	}
@@ -169,11 +169,11 @@ func TestNewOperators_AllKnownOperators(t *testing.T) {
 		{"NOT IN", `db.Table(users).Where(id NOT IN (1, 2)).Select(id).All()`, []int64{3, 4, 5, 6}},
 		{"BETWEEN", `db.Table(users).Where(age BETWEEN 25 AND 35).Select(id).All()`, []int64{1, 2, 3, 6}},
 		{"NOT BETWEEN", `db.Table(users).Where(age NOT BETWEEN 25 AND 35).Select(id).All()`, []int64{4, 5}},
-		{"LIKE prefix", `db.Table(users).Where(name LIKE "a%").Select(id).All()`, []int64{1, 6}},
-		{"NOT LIKE", `db.Table(users).Where(name NOT LIKE "a%").Select(id).All()`, []int64{2, 3, 4, 5}},
-		{"NOT paren", `db.Table(users).Where(NOT(dept = "Sales")).Select(id).All()`, []int64{1, 3, 5}},
+		{"LIKE prefix", `db.Table(users).Where(name LIKE a%).Select(id).All()`, []int64{1, 6}},
+		{"NOT LIKE", `db.Table(users).Where(name NOT LIKE a%).Select(id).All()`, []int64{2, 3, 4, 5}},
+		{"NOT paren", `db.Table(users).Where(NOT(dept = Sales)).Select(id).All()`, []int64{1, 3, 5}},
 		{"IS NOT NULL", `db.Table(users).Where(dept IS NOT NULL).Select(id).All()`, []int64{1, 2, 3, 4, 5, 6}},
-		{"compound AND", `db.Table(users).Where(dept = "Sales" AND age > 20).Select(id).All()`, []int64{2, 6}},
+		{"compound AND", `db.Table(users).Where(dept = Sales AND age > 20).Select(id).All()`, []int64{2, 6}},
 		{"compound OR", `db.Table(users).Where(age < 20 OR age > 40).Select(id).All()`, []int64{4, 5}},
 		{"compound IN+AND", `db.Table(users).Where(id IN (1, 2, 3) AND age > 20).Select(id).All()`, []int64{1, 2, 3}},
 	}

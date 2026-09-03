@@ -40,7 +40,7 @@ func BenchmarkPushdownVsInMemory(b *testing.B) {
 	for i := 1; i <= 10000; i++ {
 		dept := []string{"Engineering", "Sales", "Marketing", "HR"}[i%4]
 		_, err := EvaluateQueryNoQuotes(db, fmt.Sprintf(
-			`db.Table(users).Insert({id: %d, name: "user_%d", age: %d, dept: "%s"}).Execute()`,
+			`db.Table(users).Insert({id: %d, name: user_%d, age: %d, dept: %s}).Execute()`,
 			i, i, 20+(i%50), dept))
 		if err != nil {
 			b.Fatal(err)
@@ -48,7 +48,7 @@ func BenchmarkPushdownVsInMemory(b *testing.B) {
 	}
 	for i := 1; i <= 5000; i++ {
 		_, err := EvaluateQueryNoQuotes(db, fmt.Sprintf(
-			`db.Table(orders).Insert({id: %d, user_id: %d, amount: %f, product: "p%d"}).Execute()`,
+			`db.Table(orders).Insert({id: %d, user_id: %d, amount: %f, product: p%d}).Execute()`,
 			i, 1+(i%10000), float64(i)*1.5, i))
 		if err != nil {
 			b.Fatal(err)
@@ -62,7 +62,7 @@ func BenchmarkPushdownVsInMemory(b *testing.B) {
 	}{
 		{"Pushdown_IN", `db.Table(users).Where(id IN (1, 100, 500, 1000, 5000, 9999)).All()`},
 		{"Pushdown_BETWEEN", `db.Table(users).Where(age BETWEEN 25 AND 35).All()`},
-		{"Pushdown_LIKE", `db.Table(users).Where(name LIKE "user_5%").All()`},
+		{"Pushdown_LIKE", `db.Table(users).Where(name LIKE user_5%).All()`},
 		{"Pushdown_FullScan", `db.Table(users).All()`},
 		{"Pushdown_TopN", `db.Table(users).OrderBy(age, DESC).Take(10).All()`},
 		{"InMemory_GROUP_BY", `db.Table(users).GroupBy(dept).Select(dept, Count()).All()`},

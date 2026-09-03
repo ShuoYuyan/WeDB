@@ -1,14 +1,14 @@
 package wqlv3
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/wedb/wedb/WQL/pkg/wql/lexer"
 )
 
-// TestNoQuotesParser 测试无双引号 WQL 解析器
-// 这是关键的"设计原则"测试：WQL 不需要双引号
+// TestNoQuotesParser validates no-quote WQL parsing.
+// WQL's core design principle: identifiers and string values do NOT
+// require double quotes.
 func TestNoQuotesParser(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -17,7 +17,7 @@ func TestNoQuotesParser(t *testing.T) {
 		validate func(t *testing.T, result QueryResult)
 	}{
 		{
-			name:    "基础查询 - 无双引号",
+			name:    "basic query - no quotes",
 			input:   `db.Table(users).All()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
@@ -27,7 +27,7 @@ func TestNoQuotesParser(t *testing.T) {
 			},
 		},
 		{
-			name:    "带WHERE - 无双引号",
+			name:    "WHERE - no quotes",
 			input:   `db.Table(users).Where(age > 25).All()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
@@ -37,7 +37,7 @@ func TestNoQuotesParser(t *testing.T) {
 			},
 		},
 		{
-			name:    "带SELECT - 无双引号",
+			name:    "SELECT - no quotes",
 			input:   `db.Table(users).Select(name, age).All()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
@@ -53,14 +53,13 @@ func TestNoQuotesParser(t *testing.T) {
 			},
 		},
 		{
-			name:    "复合查询 - Select + Where + OrderBy + Take",
+			name:    "composite - Select + Where + OrderBy + Take",
 			input:   `db.Table(users).Select(name, age).Where(age > 18).OrderBy(age, DESC).Take(2).All()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
 				if len(result.Rows) != 2 {
 					t.Errorf("expected 2 rows, got %d", len(result.Rows))
 				}
-				// 验证排序：第一行应该是年龄最大的
 				if len(result.Rows) >= 1 {
 					first := result.Rows[0]
 					if age, ok := first["age"].(int64); !ok || age < 30 {
@@ -70,8 +69,8 @@ func TestNoQuotesParser(t *testing.T) {
 			},
 		},
 		{
-			name:    "First - 返回单行",
-			input:   `db.Table(users).Where(name = "alice").First()`,
+			name:    "First - single row",
+			input:   `db.Table(users).Where(name = alice).First()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
 				if len(result.Rows) != 1 {
@@ -80,17 +79,17 @@ func TestNoQuotesParser(t *testing.T) {
 			},
 		},
 		{
-			name:    "字符串字面量 - 带引号是必需的",
-			input:   `db.Table(users).Where(name = "alice").First()`,
+			name:    "no-quote string value (bare identifier as literal)",
+			input:   `db.Table(users).Where(name = alice).First()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
 				if len(result.Rows) != 1 {
-					t.Errorf("expected 1 row for name=\"alice\", got %d", len(result.Rows))
+					t.Errorf("expected 1 row for name=alice, got %d", len(result.Rows))
 				}
 			},
 		},
 		{
-			name:    "Skip - 偏移",
+			name:    "Skip - offset",
 			input:   `db.Table(users).Skip(1).Take(1).All()`,
 			wantErr: false,
 			validate: func(t *testing.T, result QueryResult) {
@@ -121,7 +120,8 @@ func TestNoQuotesParser(t *testing.T) {
 	}
 }
 
-// TestNoQuotesLexerLexicalAnalysis 测试 lexer 的无双引号 token 化
+// TestNoQuotesLexerLexicalAnalysis verifies that the lexer produces
+// IDENTIFIER tokens for table/column names without requiring quotes.
 func TestNoQuotesLexerLexicalAnalysis(t *testing.T) {
 	lex := lexer.NewLexer("db.Table(users).Select(name, age).All()")
 	tokens := []lexer.Token{}
@@ -132,9 +132,7 @@ func TestNoQuotesLexerLexicalAnalysis(t *testing.T) {
 			break
 		}
 	}
-	// 验证能成功解析为期望的 token 流
-	fmt.Printf("Token count: %d\n", len(tokens))
-	// 不做精确比较，只验证关键 token 存在
+	t.Logf("Token count: %d", len(tokens))
 	var hasDB, hasTable, hasSelect, hasAll, hasUsers bool
 	for _, tok := range tokens {
 		switch tok.Type {

@@ -42,21 +42,21 @@ func TestIntegration_FullFeatureMatrix(t *testing.T) {
 		}
 	}
 
-	// 2. INSERT
+	// 2. INSERT — WQL 无双引号设计：字符串值不需要引号
 	inserts := []string{
-		`db.Table(departments).Insert({id: 1, name: "Engineering"}).Execute()`,
-		`db.Table(departments).Insert({id: 2, name: "Sales"}).Execute()`,
-		`db.Table(departments).Insert({id: 3, name: "Marketing"}).Execute()`,
-		`db.Table(users).Insert({id: 1, name: "alice", age: 30, dept: "Engineering"}).Execute()`,
-		`db.Table(users).Insert({id: 2, name: "bob", age: 25, dept: "Sales"}).Execute()`,
-		`db.Table(users).Insert({id: 3, name: "carol", age: 35, dept: "Engineering"}).Execute()`,
-		`db.Table(users).Insert({id: 4, name: "dave", age: 17, dept: "Sales"}).Execute()`,
-		`db.Table(users).Insert({id: 5, name: "eve", age: 45, dept: "Marketing"}).Execute()`,
-		`db.Table(orders).Insert({id: 1, user_id: 1, amount: 100.50, product: "laptop"}).Execute()`,
-		`db.Table(orders).Insert({id: 2, user_id: 1, amount: 20.00, product: "mouse"}).Execute()`,
-		`db.Table(orders).Insert({id: 3, user_id: 2, amount: 50.00, product: "keyboard"}).Execute()`,
-		`db.Table(orders).Insert({id: 4, user_id: 3, amount: 200.00, product: "monitor"}).Execute()`,
-		`db.Table(orders).Insert({id: 5, user_id: 5, amount: 500.00, product: "phone"}).Execute()`,
+		`db.Table(departments).Insert({id: 1, name: Engineering}).Execute()`,
+		`db.Table(departments).Insert({id: 2, name: Sales}).Execute()`,
+		`db.Table(departments).Insert({id: 3, name: Marketing}).Execute()`,
+		`db.Table(users).Insert({id: 1, name: alice, age: 30, dept: Engineering}).Execute()`,
+		`db.Table(users).Insert({id: 2, name: bob, age: 25, dept: Sales}).Execute()`,
+		`db.Table(users).Insert({id: 3, name: carol, age: 35, dept: Engineering}).Execute()`,
+		`db.Table(users).Insert({id: 4, name: dave, age: 17, dept: Sales}).Execute()`,
+		`db.Table(users).Insert({id: 5, name: eve, age: 45, dept: Marketing}).Execute()`,
+		`db.Table(orders).Insert({id: 1, user_id: 1, amount: 100.50, product: laptop}).Execute()`,
+		`db.Table(orders).Insert({id: 2, user_id: 1, amount: 20.00, product: mouse}).Execute()`,
+		`db.Table(orders).Insert({id: 3, user_id: 2, amount: 50.00, product: keyboard}).Execute()`,
+		`db.Table(orders).Insert({id: 4, user_id: 3, amount: 200.00, product: monitor}).Execute()`,
+		`db.Table(orders).Insert({id: 5, user_id: 5, amount: 500.00, product: phone}).Execute()`,
 	}
 	for _, q := range inserts {
 		if _, err := EvaluateQueryNoQuotes(db, q); err != nil {
@@ -64,7 +64,7 @@ func TestIntegration_FullFeatureMatrix(t *testing.T) {
 		}
 	}
 
-	// 3. SELECT
+	// 3. SELECT — 全部使用无双引号字符串字面量
 	cases := []struct {
 		name   string
 		query  string
@@ -73,19 +73,19 @@ func TestIntegration_FullFeatureMatrix(t *testing.T) {
 		// 基础
 		{"全表扫描", `db.Table(users).All()`, 5},
 		{"投影", `db.Table(users).Select(name, age).All()`, 5},
-		{"WHERE 等于", `db.Table(users).Where(name = "alice").All()`, 1},
+		{"WHERE 等于", `db.Table(users).Where(name = alice).All()`, 1},
 		{"WHERE 不等", `db.Table(users).Where(age != 30).All()`, 4},
 		{"WHERE 大于", `db.Table(users).Where(age > 30).All()`, 2},
-		{"WHERE AND", `db.Table(users).Where(age > 18 AND dept = "Sales").All()`, 1},
+		{"WHERE AND", `db.Table(users).Where(age > 18 AND dept = Sales).All()`, 1},
 		{"WHERE OR", `db.Table(users).Where(age < 20 OR age > 40).All()`, 2},
-		{"WHERE NOT", `db.Table(users).Where(NOT(dept = "Sales")).All()`, 3},
+		{"WHERE NOT", `db.Table(users).Where(NOT(dept = Sales)).All()`, 3},
 		// 新算符
 		{"IN", `db.Table(users).Where(id IN (1, 3, 5)).All()`, 3},
 		{"NOT IN", `db.Table(users).Where(id NOT IN (1, 2)).All()`, 3},
 		{"BETWEEN", `db.Table(users).Where(age BETWEEN 25 AND 35).All()`, 3},
 		{"NOT BETWEEN", `db.Table(users).Where(age NOT BETWEEN 25 AND 35).All()`, 2},
-		{"LIKE", `db.Table(users).Where(name LIKE "a%").All()`, 1},
-		{"NOT LIKE", `db.Table(users).Where(name NOT LIKE "a%").All()`, 4},
+		{"LIKE", `db.Table(users).Where(name LIKE a%).All()`, 1},
+		{"NOT LIKE", `db.Table(users).Where(name NOT LIKE a%).All()`, 4},
 		{"IS NOT NULL", `db.Table(users).Where(dept IS NOT NULL).All()`, 5},
 		{"IS NULL", `db.Table(users).Where(dept IS NULL).All()`, 0},
 		// 排序 / 分页
@@ -215,7 +215,7 @@ func TestIntegration_DDLOrder(t *testing.T) {
 	if _, err := EvaluateQueryNoQuotes(db, `db.Table(temp).Create(id INTEGER PRIMARY KEY, name TEXT).Execute()`); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := EvaluateQueryNoQuotes(db, `db.Table(temp).Insert({id: 1, name: "x"}).Execute()`); err != nil {
+	if _, err := EvaluateQueryNoQuotes(db, `db.Table(temp).Insert({id: 1, name: x}).Execute()`); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	if _, err := EvaluateQueryNoQuotes(db, `db.Table(temp).Drop().Execute()`); err != nil {

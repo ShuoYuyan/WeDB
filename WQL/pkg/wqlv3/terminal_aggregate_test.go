@@ -167,7 +167,7 @@ func TestUpdateSetWhere(t *testing.T) {
 		{"id": int64(1), "name": "alice", "age": int64(30)},
 	})
 
-	_, err := EvaluateQueryNoQuotes(db, `db.Table(users).Set(age, 35).Where(name = "alice").Execute()`)
+	_, err := EvaluateQueryNoQuotes(db, `db.Table(users).Set(age, 35).Where(name = alice).Execute()`)
 	if err != nil {
 		t.Fatalf("Set().Where() failed: %v", err)
 	}

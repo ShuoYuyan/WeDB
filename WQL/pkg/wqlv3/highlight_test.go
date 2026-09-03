@@ -14,13 +14,14 @@ func TestHighlightSimple_Keywords(t *testing.T) {
 }
 
 func TestHighlightSimple_Strings(t *testing.T) {
-	in := `db.Table(users).Where(name = "alice").All()`
+	// WQL 无双引号设计：字符串字面量作为 bare identifier
+	in := `db.Table(users).Where(name = alice).All()`
 	// 关闭颜色以检查纯文本
 	SetColorEnabled(false)
 	defer SetColorEnabled(true)
 	out := HighlightSimple(in)
-	if !strings.Contains(out, `"alice"`) {
-		t.Errorf("expected string literal preserved: got %q", out)
+	if !strings.Contains(out, "alice") {
+		t.Errorf("expected no-quote string literal preserved: got %q", out)
 	}
 }
 

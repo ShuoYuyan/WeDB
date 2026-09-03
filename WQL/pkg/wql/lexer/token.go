@@ -35,6 +35,8 @@ const (
 	TOKEN_BOOLEAN
 	TOKEN_NULL
 
+	// Literal pattern for LIKE (may include % and _)
+	TOKEN_LIKE_PATTERN
 	// 运算符
 	TOKEN_PLUS
 	TOKEN_MINUS
