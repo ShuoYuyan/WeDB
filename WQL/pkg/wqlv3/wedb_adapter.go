@@ -281,6 +281,10 @@ type Transaction interface {
 	InsertRows(tableName string, rows []map[string]interface{}) error
 	UpdateRow(tableName string, row map[string]interface{}, condition string) error
 	DeleteRow(tableName string, condition string) error
+	// Savepoint
+	Savepoint(name string) error
+	RollbackTo(name string) error
+	ReleaseSavepoint(name string) error
 }
 
 type weDBTx struct {
@@ -316,6 +320,9 @@ func (t *weDBTx) UpdateRow(tableName string, row map[string]interface{}, conditi
 func (t *weDBTx) DeleteRow(tableName string, condition string) error {
 	return t.wedb.DeleteRow(tableName, condition)
 }
+func (t *weDBTx) Savepoint(name string) error         { return t.tx.Savepoint(name) }
+func (t *weDBTx) RollbackTo(name string) error        { return t.tx.RollbackTo(name) }
+func (t *weDBTx) ReleaseSavepoint(name string) error  { return t.tx.ReleaseSavepoint(name) }
 
 // ===== 表达式引擎（内部 WHERE 解析辅助） =====
 

@@ -376,6 +376,9 @@ func (t *mockTx) UpdateRow(tableName string, row map[string]interface{}, conditi
 func (t *mockTx) DeleteRow(tableName string, condition string) error {
 	return t.adapter.DeleteRow(tableName, condition)
 }
+func (t *mockTx) Savepoint(name string) error        { return nil }
+func (t *mockTx) RollbackTo(name string) error       { return nil }
+func (t *mockTx) ReleaseSavepoint(name string) error { return nil }
 
 func filterByCondition(rows []map[string]interface{}, condition string) ([]map[string]interface{}, error) {
 	if condition == "" {
