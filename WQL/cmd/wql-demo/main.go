@@ -180,6 +180,24 @@ func main() {
 	q := `db.Table(orders).Where(amount > 100).OrderBy(amount, DESC).Take(5).All()`
 	fmt.Println(wqlv3.HighlightSimple(q))
 
+	// 15. CASE WHEN / COALESCE / NULLIF / CAST (no-quote expressions)
+	header("15. CASE WHEN / COALESCE / NULLIF / CAST (no-quote)")
+	run(db, `db.Table(orders).Select(id, CASE WHEN amount > 100 THEN high WHEN amount > 50 THEN mid ELSE low END).All()`)
+	run(db, `db.Table(orders).Select(id, COALESCE(status, unknown)).All()`)
+	run(db, `db.Table(orders).Select(id, NULLIF(status, cancelled)).All()`)
+	run(db, `db.Table(orders).Select(id, CAST(amount AS INTEGER)).All()`)
+
+	// 16. UPSERT (ON CONFLICT)
+	header("16. UPSERT / ON CONFLICT")
+	run(db, `db.Table(orders).Insert({id: 100, amount: 999, status: first}).Execute()`)
+	run(db, `db.Table(orders).Insert({id: 100, amount: 1000, status: second}).OnConflict(UPDATE, id).Execute()`)
+	run(db, `db.Table(orders).Where(id = 100).All()`)
+
+	// 17. No-quote keyword as value (WQL design principle)
+	header("17. No-quote keyword as value")
+	// 以下字面量值都是 WQL 关键字；无双引号设计下应自动视为字符串
+	run(db, `db.Table(orders).Select(id, CASE WHEN status = first THEN primary WHEN status = second THEN backup ELSE other END).All()`)
+
 	header("Done")
 }
 

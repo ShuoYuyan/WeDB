@@ -108,6 +108,12 @@ const (
 	TOKEN_COALESCE
 	TOKEN_NULLIF
 	TOKEN_CAST
+	// CASE WHEN expression
+	TOKEN_CASE
+	TOKEN_WHEN
+	TOKEN_THEN
+	TOKEN_ELSE
+	TOKEN_END
 	TOKEN_INTERSECT
 	TOKEN_EXCEPT
 	TOKEN_AS
@@ -118,6 +124,7 @@ const (
 	TOKEN_INSERT
 	TOKEN_UPDATE
 	TOKEN_DELETE
+	TOKEN_ON_CONFLICT
 	TOKEN_SET
 	TOKEN_INTO
 	TOKEN_VALUES
@@ -220,6 +227,7 @@ var tokenNames = map[TokenType]string{
 	TOKEN_EXECUTE:  "EXECUTE",
 	TOKEN_CREATE:   "CREATE",
 	TOKEN_DROP:     "DROP",
+	TOKEN_ON_CONFLICT: "ON_CONFLICT",
 	TOKEN_PRIMARY:  "PRIMARY",
 	TOKEN_KEY:      "KEY",
 	TOKEN_DEFAULT:  "DEFAULT",
@@ -267,6 +275,11 @@ var keywords = map[string]TokenType{
 	"COALESCE":   TOKEN_COALESCE,
 	"NULLIF":     TOKEN_NULLIF,
 	"CAST":       TOKEN_CAST,
+	"CASE":       TOKEN_CASE,
+	"WHEN":       TOKEN_WHEN,
+	"THEN":       TOKEN_THEN,
+	"ELSE":       TOKEN_ELSE,
+	"END":        TOKEN_END,
 	"BETWEEN":    TOKEN_BETWEEN,
 	"IS":         TOKEN_IS,
 	"NULL":       TOKEN_NULL,
@@ -289,6 +302,7 @@ var keywords = map[string]TokenType{
 	"Insert":      TOKEN_INSERT,
 	"Update":      TOKEN_UPDATE,
 	"Delete":      TOKEN_DELETE,
+	"OnConflict":  TOKEN_ON_CONFLICT,
 	"Set":         TOKEN_SET,
 	"Into":        TOKEN_INTO,
 	"Values":      TOKEN_VALUES,

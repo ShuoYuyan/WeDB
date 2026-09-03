@@ -93,9 +93,18 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 					if len(fc.Arguments) > 0 {
 						agg.Column = exprToString(fc.Arguments[0])
 					}
-					// 检查后续是否有 AS alias
 					_ = agg
 					qb = qb.AddAggregate(fc.Name, agg.Column, "")
+				}
+				// 非平凡表达式（CASE WHEN / COALESCE / NULLIF / CAST）注册为投影表达式
+				if _, ok := c.(*parser.CaseWhenExpression); ok {
+					qb = qb.AddSelectExpression(exprToString(c), "")
+				} else if _, ok := c.(*parser.CoalesceExpression); ok {
+					qb = qb.AddSelectExpression(exprToString(c), "")
+				} else if _, ok := c.(*parser.NullIfExpression); ok {
+					qb = qb.AddSelectExpression(exprToString(c), "")
+				} else if _, ok := c.(*parser.CastExpression); ok {
+					qb = qb.AddSelectExpression(exprToString(c), "")
 				}
 			}
 			qb = qb.Select(cols...)
@@ -165,6 +174,15 @@ func buildQueryBuilder(db *Database, query *parser.WQLQuery) (*QueryBuilder, err
 			qb = qb.Join(joinType, tableName, leftKey, rightKey, onExpr)
 		case *parser.InsertOperation:
 			// 延后到 executeQuery 中执行；表名从 query.Source 取得
+		case *parser.OnConflictOperation:
+			// 附加到最近一个 InsertOperation
+			for i := len(query.Operations) - 1; i >= 0; i-- {
+				if ins, ok := query.Operations[i].(*parser.InsertOperation); ok {
+					ins.OnConflict = o.Strategy
+					ins.OnConflictKey = o.Key
+					break
+				}
+			}
 		case *parser.SetOperation:
 			// 延后到 executeQuery 中执行；记录 Set 之后的最近一个 Where 作为条件
 			cond := findWhereAfter(query.Operations, o)
@@ -272,7 +290,11 @@ func runOperations(db *Database, qb *QueryBuilder, ops []parser.Operation, resul
 						rows = append(rows, objectLiteralToMap(obj))
 					}
 				}
-				n, err := db.Insert(qb.tableName).Values(rows...).Execute()
+				ib := db.Insert(qb.tableName).Values(rows...)
+				if o.OnConflict != "" {
+					ib.OnConflict(o.OnConflict, o.OnConflictKey)
+				}
+				n, err := ib.Execute()
 				if err != nil {
 					return result, err
 				}
@@ -618,6 +640,25 @@ func astToString(e parser.Expression) string {
 		return fmt.Sprintf("NULLIF(%s, %s)", astToString(v.A), astToString(v.B))
 	case *parser.CastExpression:
 		return fmt.Sprintf("CAST(%s AS %s)", astToString(v.Expr), v.Type)
+	case *parser.CaseWhenExpression:
+		var sb strings.Builder
+		sb.WriteString("CASE")
+		if v.Input != nil {
+			sb.WriteString(" ")
+			sb.WriteString(astToString(v.Input))
+		}
+		for _, w := range v.WhenClauses {
+			sb.WriteString(" WHEN ")
+			sb.WriteString(astToString(w.Condition))
+			sb.WriteString(" THEN ")
+			sb.WriteString(astToString(w.Result))
+		}
+		if v.ElseValue != nil {
+			sb.WriteString(" ELSE ")
+			sb.WriteString(astToString(v.ElseValue))
+		}
+		sb.WriteString(" END")
+		return sb.String()
 	case *parser.CallExpression:
 		args := make([]string, len(v.Arguments))
 		for i, a := range v.Arguments {

@@ -572,9 +572,8 @@ func parseLastMethod(rest string) (string, []string) {
 // ===== DML 评估器（CLI 字符串接口） =====
 
 // evaluateInsert 处理 INSERT("table").Values({...}).Execute()
-// 简化语法:
-//   Insert("users").Values(map[string]interface{}{"id": 1, "name": "alice"}).Execute()
-//   Insert("users").Values({id: 1, name: "alice"}).Execute()
+// 简化语法 (Go API 形式; WQL 字符串语法请用 db.Table(...).Insert(...).Execute()):
+//   db.Table(users).Insert({id: 1, name: alice, age: 30}).Execute()
 func evaluateInsert(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
 	// 提取表名: Insert("name")
 	idx := strings.Index(expr, "Insert(")
@@ -603,10 +602,11 @@ func evaluateInsert(db *Database, expr string, start time.Time, result QueryResu
 	return result, nil
 }
 
-// evaluateUpdate 处理 UPDATE("table").Set(col, val).Where(cond).Execute()
-// 简化语法:
-//   Update("users").Set("name", "bob").Where("id = 1").Execute()
-//   Update("users").Sets({name: "bob", age: 30}).Where("id = 1").Execute()
+// evaluateUpdate 处理 UPDATE 语句（Go API 形式; WQL 字符串语法请用
+// db.Table(...).Set(col, val).Where(cond).Execute()）。
+// WQL 字符串语法示例（无双引号）:
+//   db.Table(users).Set(name, bob).Where(id = 1).Execute()
+//   db.Table(users).Set(name, bob, age, 30).Where(id = 1).Execute()
 func evaluateUpdate(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
 	idx := strings.Index(expr, "Update(")
 	if idx < 0 {
@@ -666,8 +666,7 @@ func evaluateDelete(db *Database, expr string, start time.Time, result QueryResu
 }
 
 // evaluateCreateTable 处理 CREATE TABLE
-// 简化语法: CreateTable("users", {id: "INTEGER PK", name: "TEXT", age: "INTEGER"})
-// 或:      CreateTable("users", ["id INTEGER PRIMARY KEY", "name TEXT", "age INTEGER"])
+// WQL 字符串语法（无双引号）: db.Table(users).Create(id INTEGER PRIMARY KEY, name TEXT, age INTEGER).Execute()
 func evaluateCreateTable(db *Database, expr string, start time.Time, result QueryResult) (QueryResult, error) {
 	// 跳过 "CreateTable(" 前缀
 	rest := expr[12:]

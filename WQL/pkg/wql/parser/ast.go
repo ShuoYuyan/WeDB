@@ -215,12 +215,33 @@ func (a *AllOperation) operationNode() {}
 // ===== DML Operations =====
 
 // InsertOperation INSERT 操作
-// 语法: db.Table(users).Insert({id: 1, name: "alice", age: 30}).Execute()
-//     db.Table(users).Insert({id: 1, name: "alice"}, {id: 2, name: "bob"}).Execute()
+// 语法（无双引号设计）:
+//     db.Table(users).Insert({id: 1, name: alice, age: 30}).Execute()
+//     db.Table(users).Insert({id: 1, name: alice}, {id: 2, name: bob}).Execute()
+//     db.Table(users).Insert({id: 1, name: alice}).OnConflict(UPDATE, id).Execute()
 type InsertOperation struct {
-	Table Expression // 表名（来自 db.Table(name)）
-	Rows  []Expression // 值列表，每个是 {col: val, ...} 形式的对象表达式
+	Table         Expression // 表名（来自 db.Table(name)）
+	Rows          []Expression // 值列表，每个是 {col: val, ...} 形式的对象表达式
+	OnConflict    string    // 可选: "UPDATE" / "IGNORE" / "DO NOTHING"
+	OnConflictKey string    // 可选: 冲突检测键
 }
+
+// OnConflictOperation ON CONFLICT 子句：附加在 Insert 后
+// 例: .OnConflict(UPDATE, id) — id 冲突时改为更新
+//     .OnConflict(IGNORE)     — 冲突时跳过
+type OnConflictOperation struct {
+	Strategy string // "UPDATE" / "IGNORE" / "DO NOTHING"
+	Key      string // 冲突键（列名）；空表示自动选择
+}
+
+func (o *OnConflictOperation) String() string {
+	if o.Key != "" {
+		return fmt.Sprintf("ON_CONFLICT(%s, %s)", o.Strategy, o.Key)
+	}
+	return fmt.Sprintf("ON_CONFLICT(%s)", o.Strategy)
+}
+
+func (o *OnConflictOperation) operationNode() {}
 
 func (i *InsertOperation) String() string {
 	rows := make([]string, len(i.Rows))
@@ -646,6 +667,43 @@ func (e *CastExpression) String() string {
 }
 
 func (e *CastExpression) expressionNode() {}
+
+// CaseWhenExpression CASE WHEN cond THEN val [WHEN ...] [ELSE val] END
+type CaseWhenExpression struct {
+	// Optional: simple CASE (CASE expr WHEN val THEN result)
+	Input Expression
+	// Searched CASE: list of WHEN conditions
+	WhenClauses []CaseWhenClause
+	ElseValue   Expression
+}
+
+type CaseWhenClause struct {
+	Condition Expression
+	Result    Expression
+}
+
+func (e *CaseWhenExpression) String() string {
+	var sb strings.Builder
+	sb.WriteString("CASE")
+	if e.Input != nil {
+		sb.WriteString(" ")
+		sb.WriteString(e.Input.String())
+	}
+	for _, w := range e.WhenClauses {
+		sb.WriteString(" WHEN ")
+		sb.WriteString(w.Condition.String())
+		sb.WriteString(" THEN ")
+		sb.WriteString(w.Result.String())
+	}
+	if e.ElseValue != nil {
+		sb.WriteString(" ELSE ")
+		sb.WriteString(e.ElseValue.String())
+	}
+	sb.WriteString(" END")
+	return sb.String()
+}
+
+func (e *CaseWhenExpression) expressionNode() {}
 
 // DistinctOperation DISTINCT 去重操作
 type DistinctOperation struct {

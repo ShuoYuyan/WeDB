@@ -143,6 +143,8 @@ func (p *Parser) parseOperation() (Operation, error) {
 		return p.parseExceptOperation()
 	case lexer.TOKEN_INSERT:
 		return p.parseInsertOperation()
+	case lexer.TOKEN_ON_CONFLICT:
+		return p.parseOnConflictOperation()
 	case lexer.TOKEN_SET:
 		return p.parseSetOperation()
 	case lexer.TOKEN_DELETE:
@@ -933,7 +935,16 @@ func (p *Parser) parsePrimaryExpression() (Expression, error) {
 		value := p.currentToken.Value
 		p.nextToken()
 		return &LiteralExpression{Value: value}, nil
+	case lexer.TOKEN_CASE:
+		return p.parseCaseExpression()
 	default:
+		// WQL 无双引号设计：关键字 token 在值上下文中视为字符串字面量
+		// (避免 {name: first} 之类的合法无引号用法因 first 是 TOKEN_FIRST 而失败)
+		if p.currentToken.Value != "" {
+			v := p.currentToken.Value
+			p.nextToken()
+			return &Identifier{Value: v}, nil
+		}
 		return nil, fmt.Errorf("unexpected token in expression: %s", p.currentToken.Type)
 	}
 }
@@ -1208,6 +1219,62 @@ func (p *Parser) parseLikePattern() (string, error) {
 	return p.currentToken.Value, nil
 }
 
+// parseCaseExpression 解析 CASE WHEN expression
+// 两种形式：
+//   1. Searched CASE: CASE WHEN cond1 THEN r1 WHEN cond2 THEN r2 ... [ELSE re] END
+//   2. Simple CASE:   CASE expr WHEN v1 THEN r1 WHEN v2 THEN r2 ... [ELSE re] END
+func (p *Parser) parseCaseExpression() (Expression, error) {
+	// currentToken 已经是 CASE
+	p.nextToken() // 跳过 CASE
+
+	// 检查是否有 simple CASE input（不是 WHEN 也不是 END）
+	expr := &CaseWhenExpression{}
+	if p.currentToken.Type != lexer.TOKEN_WHEN && p.currentToken.Type != lexer.TOKEN_END {
+		input, err := p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("CASE expression parse: %w", err)
+		}
+		expr.Input = input
+	}
+
+	// 解析 WHEN clauses
+	for p.currentToken.Type == lexer.TOKEN_WHEN {
+		p.nextToken() // 跳过 WHEN
+		cond, err := p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("CASE WHEN condition: %w", err)
+		}
+		if p.currentToken.Type != lexer.TOKEN_THEN {
+			return nil, fmt.Errorf("expected THEN after CASE WHEN, got %s", p.currentToken.Type)
+		}
+		p.nextToken() // 跳过 THEN
+		result, err := p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("CASE THEN result: %w", err)
+		}
+		expr.WhenClauses = append(expr.WhenClauses, CaseWhenClause{
+			Condition: cond,
+			Result:    result,
+		})
+	}
+
+	// 可选 ELSE
+	if p.currentToken.Type == lexer.TOKEN_ELSE {
+		p.nextToken()
+		elseVal, err := p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("CASE ELSE value: %w", err)
+		}
+		expr.ElseValue = elseVal
+	}
+
+	if p.currentToken.Type != lexer.TOKEN_END {
+		return nil, fmt.Errorf("expected END in CASE expression, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 END
+	return expr, nil
+}
+
 func (p *Parser) nextToken() {
 	p.currentToken = p.peekToken
 	p.peekToken = p.lexer.NextToken()
@@ -1300,6 +1367,50 @@ func (p *Parser) parseInsertOperation() (*InsertOperation, error) {
 	// Insert 必须依赖 db.Table 提供的表名, 返回的 Operation 暂留 Table 为 nil，
 	// 在 buildQueryBuilder 中通过 query.Source 填充
 	return &InsertOperation{Table: nil, Rows: rows}, nil
+}
+
+// parseOnConflictOperation 解析 ON CONFLICT 子句
+// 语法: .OnConflict(UPDATE, key) 或 .OnConflict(IGNORE)
+// 第一个参数是策略（UPDATE / IGNORE / DO NOTHING），第二个是可选冲突键
+func (p *Parser) parseOnConflictOperation() (*OnConflictOperation, error) {
+	p.nextToken() // 跳过 OnConflict
+	if p.currentToken.Type != lexer.TOKEN_LPAREN {
+		return nil, fmt.Errorf("expected '(' after OnConflict, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 (
+	strategy, err := p.parseExpression()
+	if err != nil {
+		return nil, err
+	}
+	stratStr := strings.ToUpper(strings.Trim(exprToStringSimple(strategy), `"'`))
+	var key string
+	if p.currentToken.Type == lexer.TOKEN_COMMA {
+		p.nextToken()
+		keyExpr, err := p.parseExpression()
+		if err != nil {
+			return nil, err
+		}
+		key = exprToStringSimple(keyExpr)
+	}
+	if p.currentToken.Type != lexer.TOKEN_RPAREN {
+		return nil, fmt.Errorf("expected ')' to close OnConflict, got %s", p.currentToken.Type)
+	}
+	p.nextToken() // 跳过 )
+	return &OnConflictOperation{Strategy: stratStr, Key: key}, nil
+}
+
+// exprToStringSimple 简单的 Expression → string 转换（用于 OnConflict 参数）
+func exprToStringSimple(e Expression) string {
+	switch v := e.(type) {
+	case *LiteralExpression:
+		if s, ok := v.Value.(string); ok {
+			return s
+		}
+		return fmt.Sprintf("%v", v.Value)
+	case *Identifier:
+		return v.Value
+	}
+	return ""
 }
 
 // parseObjectLiteral 解析 {key: val, key: val, ...}

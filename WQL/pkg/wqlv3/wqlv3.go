@@ -117,10 +117,31 @@ func (d *Database) Ping() error {
 // 用法: db.Insert("users").Values(row1, row2, ...).Execute()
 // 如果 Database 持有 currentTx，DML 会自动在该事务中执行。
 type InsertBuilder struct {
-	db        Adapter
-	tx        Transaction
-	tableName string
-	rows      []map[string]interface{}
+	db          Adapter
+	tx          Transaction
+	tableName   string
+	rows        []map[string]interface{}
+	orUpdate    bool                                                       // 冲突时改为更新（UPSERT）
+	conflictKey string                                                     // 冲突检测的键（列名）
+}
+
+// OnConflict 设置 ON CONFLICT 行为
+//   - OrUpdate: 冲突时改为更新（覆盖）
+//   - OrIgnore: 冲突时跳过
+// 这是 WQL 无双引号设计的另一种体现：操作语义优先。
+func (ib *InsertBuilder) OnConflict(strategy string, key ...string) *InsertBuilder {
+	switch strings.ToUpper(strategy) {
+	case "UPDATE", "OR UPDATE":
+		ib.orUpdate = true
+		if len(key) > 0 {
+			ib.conflictKey = key[0]
+		}
+	case "IGNORE", "OR IGNORE", "DO NOTHING":
+		ib.orUpdate = false
+	default:
+		ib.orUpdate = false
+	}
+	return ib
 }
 
 // Values 设置要插入的行（单行或多行）
@@ -138,6 +159,10 @@ func (ib *InsertBuilder) Value(row map[string]interface{}) *InsertBuilder {
 func (ib *InsertBuilder) Execute() (int64, error) {
 	if len(ib.rows) == 0 {
 		return 0, fmt.Errorf("no rows to insert")
+	}
+	// UPSERT 处理
+	if ib.orUpdate {
+		return ib.executeUpsert()
 	}
 	if ib.tx != nil && ib.tx.IsActive() {
 		if err := ib.tx.InsertRow(ib.tableName, ib.rows[0]); err != nil {
@@ -160,6 +185,67 @@ func (ib *InsertBuilder) Execute() (int64, error) {
 		return 0, err
 	}
 	return int64(len(ib.rows)), nil
+}
+
+// executeUpsert 实现 INSERT ... ON CONFLICT DO UPDATE
+// 策略：尝试插入；遇到冲突时，改为 Update。
+// 冲突检测：
+//   - 若指定了 conflictKey，以该列的值作为查找条件
+//   - 否则，遍历第一行所有列作为复合冲突键
+func (ib *InsertBuilder) executeUpsert() (int64, error) {
+	var affected int64
+	for _, row := range ib.rows {
+		err := ib.tryInsertOrUpdate(row)
+		if err != nil {
+			return affected, err
+		}
+		affected++
+	}
+	return affected, nil
+}
+
+func (ib *InsertBuilder) tryInsertOrUpdate(row map[string]interface{}) error {
+	// 尝试插入
+	var insertErr error
+	if ib.tx != nil && ib.tx.IsActive() {
+		insertErr = ib.tx.InsertRow(ib.tableName, row)
+	} else {
+		insertErr = ib.db.InsertRow(ib.tableName, row)
+	}
+	if insertErr == nil {
+		return nil
+	}
+	// 构造冲突条件
+	cond := ib.buildConflictCondition(row)
+	// 改为更新
+	if ib.tx != nil && ib.tx.IsActive() {
+		return ib.tx.UpdateRow(ib.tableName, row, cond)
+	}
+	return ib.db.UpdateRow(ib.tableName, row, cond)
+}
+
+func (ib *InsertBuilder) buildConflictCondition(row map[string]interface{}) string {
+	if ib.conflictKey != "" {
+		if v, ok := row[ib.conflictKey]; ok {
+			return fmt.Sprintf("%s = %v", ib.conflictKey, formatWhereValue(v))
+		}
+	}
+	// 默认：用所有主键列
+	parts := make([]string, 0, len(row))
+	for k, v := range row {
+		parts = append(parts, fmt.Sprintf("%s = %v", k, formatWhereValue(v)))
+	}
+	return strings.Join(parts, " AND ")
+}
+
+func formatWhereValue(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case nil:
+		return "NULL"
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 // ===== UpdateBuilder =====
@@ -363,6 +449,22 @@ type QueryBuilder struct {
 	having    string     // HAVING 条件（已格式化）
 	aggFuncs  []AggSpec  // 聚合函数规格（仅在有 GROUP BY 时使用）
 	distinct  []string   // DISTINCT 列（空 = 全部去重）
+	selectExprs []SelectExpr // 投影表达式（CASE WHEN / COALESCE / 列引用 / 字面量别名 等）
+}
+
+// SelectExpr 投影表达式：支持任意 WQL 表达式（CASE WHEN、函数调用等）
+// 在投影阶段，ExpressionType 由 parser 包产生，但这里只保存字符串形式以便评估
+type SelectExpr struct {
+	Expr string // 表达式字符串（已规范化，无双引号）
+	Alias string // 可选别名
+}
+
+// AddSelectExpression 注册一个投影表达式（支持 CASE WHEN / COALESCE / NULLIF / CAST 等）
+// expr 必须是已规范化的 WQL 字符串（无双引号）；alias 可选。
+// 当同时存在 Select() 列投影时，AddSelectExpression 的项会在列之后追加到输出行。
+func (qb *QueryBuilder) AddSelectExpression(expr, alias string) *QueryBuilder {
+	qb.selectExprs = append(qb.selectExprs, SelectExpr{Expr: expr, Alias: alias})
+	return qb
 }
 
 // 事务接口见 wedb_adapter.go 中的 Transaction 定义
@@ -572,8 +674,9 @@ func (qb *QueryBuilder) execute() ([]map[string]interface{}, error) {
 	}
 
 	// 第6步: SELECT 列投影
-	if len(qb.selects) > 0 {
-		rows = projectColumns(rows, qb.selects)
+	// 表达式必须基于完整行计算；列过滤与表达式合并在一步完成
+	if len(qb.selects) > 0 || len(qb.selectExprs) > 0 {
+		rows = projectSelectList(rows, qb.selects, qb.selectExprs)
 	}
 
 	// 第6.5步: DISTINCT 去重（qb.distinct 字段为非 nil 即启用；空列表示对所有列去重）
@@ -922,6 +1025,77 @@ func projectColumns(rows []map[string]interface{}, cols []string) []map[string]i
 				}
 			}
 			proj[c] = nil
+		}
+		out = append(out, proj)
+	}
+	return out
+}
+
+// projectExpressions 评估并投影出表达式列（CASE WHEN / COALESCE / NULLIF / CAST 等）
+// expr.Alias 为空时，列名默认取表达式字符串。
+func projectExpressions(rows []map[string]interface{}, exprs []SelectExpr) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		proj := make(map[string]interface{}, len(exprs))
+		for _, e := range exprs {
+			parsed, err := ParseValueExpression(e.Expr)
+			if err != nil {
+				// 解析失败时填 nil，保持不中断
+				key := e.Alias
+				if key == "" {
+					key = e.Expr
+				}
+				proj[key] = nil
+				continue
+			}
+			val, _ := parsed.Evaluate(row)
+			key := e.Alias
+			if key == "" {
+				key = e.Expr
+			}
+			proj[key] = val
+		}
+		out = append(out, proj)
+	}
+	return out
+}
+
+// projectSelectList 合并列投影与表达式投影：
+//   - 列名按 selects 列表输出（短名匹配退路）
+//   - 表达式按 selectExprs 列表计算并追加
+// 列投影在表达式之后亦可保持简单；若只有列，与 projectColumns 行为一致。
+func projectSelectList(rows []map[string]interface{}, cols []string, exprs []SelectExpr) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		proj := make(map[string]interface{}, len(cols)+len(exprs))
+		// 1) 列投影
+		for _, c := range cols {
+			if v, ok := row[c]; ok {
+				proj[c] = v
+				continue
+			}
+			if idx := strings.LastIndex(c, "."); idx >= 0 {
+				short := c[idx+1:]
+				if v, ok := row[short]; ok {
+					proj[c] = v
+					continue
+				}
+			}
+			proj[c] = nil
+		}
+		// 2) 表达式投影（基于完整行）
+		for _, e := range exprs {
+			parsed, err := ParseValueExpression(e.Expr)
+			key := e.Alias
+			if key == "" {
+				key = e.Expr
+			}
+			if err != nil {
+				proj[key] = nil
+				continue
+			}
+			val, _ := parsed.Evaluate(row)
+			proj[key] = val
 		}
 		out = append(out, proj)
 	}

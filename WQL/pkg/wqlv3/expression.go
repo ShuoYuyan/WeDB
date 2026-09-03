@@ -361,7 +361,378 @@ func matchLikeHelper(s string, si int, p string, pi int) bool {
 
 // ===== 字符串解析器（ParseWhere）=====
 
-// ParseWhere 解析 WHERE 子句字符串为 Expression
+// ParseConditionExpression 解析一个条件表达式（用于 CASE WHEN / WHERE 等布尔上下文）。
+// 与 ParseValueExpression 区别: bare identifier 优先解析为列引用，而非字符串字面量。
+// 支持: =, !=, <, <=, >, >=, AND, OR, NOT, IN, LIKE, IS NULL, IS NOT NULL
+func ParseConditionExpression(s string) (Expression, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty condition")
+	}
+
+	// 顶层 OR
+	if idx := findTopKeyword(s, "OR"); idx > 0 {
+		left, err := ParseConditionExpression(s[:idx])
+		if err != nil {
+			return nil, err
+		}
+		right, err := ParseConditionExpression(s[idx+2:])
+		if err != nil {
+			return nil, err
+		}
+		return &BinaryExpr{Left: left, Right: right, Op: OpOr}, nil
+	}
+	// 次层 AND
+	if idx := findTopKeyword(s, "AND"); idx > 0 {
+		left, err := ParseConditionExpression(s[:idx])
+		if err != nil {
+			return nil, err
+		}
+		right, err := ParseConditionExpression(s[idx+3:])
+		if err != nil {
+			return nil, err
+		}
+		return &BinaryExpr{Left: left, Right: right, Op: OpAnd}, nil
+	}
+	// 括号
+	if strings.HasPrefix(s, "(") {
+		if matched := matchParen(s); matched == len(s)-1 {
+			return ParseConditionExpression(s[1 : len(s)-1])
+		}
+	}
+	// NOT
+	upper := strings.ToUpper(s)
+	if strings.HasPrefix(upper, "NOT ") {
+		inner, err := ParseConditionExpression(s[4:])
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryExpr{Op: "NOT", Operand: inner}, nil
+	}
+	// IS NULL / IS NOT NULL
+	if strings.HasSuffix(upper, " IS NULL") {
+		return &IsNullExpr{Column: strings.TrimSpace(s[:len(s)-8]), Negate: false}, nil
+	}
+	if strings.HasSuffix(upper, " IS NOT NULL") {
+		return &IsNullExpr{Column: strings.TrimSpace(s[:len(s)-12]), Negate: true}, nil
+	}
+	// IN (a, b, c)
+	if idx := strings.Index(upper, " IN ("); idx > 0 {
+		col := strings.TrimSpace(s[:idx])
+		rest := s[idx+4:]
+		if end := findClosingParen(rest); end >= 0 {
+			valuesStr := rest[1:end]
+			values, err := parseValueList(valuesStr)
+			if err != nil {
+				return nil, err
+			}
+			return &InExpr{Column: col, Values: values}, nil
+		}
+	}
+	// LIKE pattern
+	if idx := strings.Index(upper, " LIKE "); idx > 0 {
+		col := strings.TrimSpace(s[:idx])
+		pattern := strings.TrimSpace(s[idx+6:])
+		pattern = strings.Trim(pattern, `"'`)
+		return &BinaryExpr{
+			Left:  &ColumnExpr{Name: col},
+			Right: &LiteralExpr{Value: pattern},
+			Op:    OpLike,
+		}, nil
+	}
+	// 二元比较
+	for _, op := range []BinaryOp{OpLe, OpGe, OpNe, OpEq, OpLt, OpGt} {
+		if idx := findOperator(s, string(op)); idx > 0 {
+			left := strings.TrimSpace(s[:idx])
+			right := strings.TrimSpace(s[idx+len(op):])
+			return &BinaryExpr{
+				Left:  toExprHelper(left),
+				Right: toExprHelper(right),
+				Op:    op,
+			}, nil
+		}
+	}
+	// 单独列引用
+	return &ColumnExpr{Name: s}, nil
+}
+
+// ParseValueExpression 解析一个值表达式（用于 SELECT 投影）。
+// 支持: CASE WHEN, COALESCE, NULLIF, CAST, 二元比较, 字面量, 列引用
+// 顶层返回的是 Expression，可使用 Evaluate 求值。
+func ParseValueExpression(s string) (Expression, error) {	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty expression")
+	}
+
+	// CASE WHEN ... END
+	upper := strings.ToUpper(s)
+	if strings.HasPrefix(upper, "CASE ") || upper == "CASE" {
+		return parseCaseWhenString(s)
+	}
+	// COALESCE(...)
+	if strings.HasPrefix(upper, "COALESCE(") {
+		return parseFuncCall(s, "COALESCE", func(args []Expression) (Expression, error) {
+			return &CoalesceExpr{Args: args}, nil
+		})
+	}
+	// NULLIF(...)
+	if strings.HasPrefix(upper, "NULLIF(") {
+		return parseNullIfString(s)
+	}
+	// CAST(... AS TYPE)
+	if strings.HasPrefix(upper, "CAST(") {
+		return parseCastString(s)
+	}
+
+	// 二元比较
+	for _, op := range []BinaryOp{OpLe, OpGe, OpNe, OpEq, OpLt, OpGt} {
+		if idx := findOperator(s, string(op)); idx > 0 {
+			left := strings.TrimSpace(s[:idx])
+			right := strings.TrimSpace(s[idx+len(op):])
+			return &BinaryExpr{
+				Left:  toValueExpr(left),
+				Right: toValueExpr(right),
+				Op:    op,
+			}, nil
+		}
+	}
+	// 单值
+	return toValueExpr(s), nil
+}
+
+// parseCaseWhenString 解析 CASE WHEN 字符串
+func parseCaseWhenString(s string) (Expression, error) {
+	rest := strings.TrimSpace(s)
+	if len(rest) >= 4 && strings.EqualFold(rest[:4], "CASE") {
+		rest = rest[4:]
+	}
+	rest = strings.TrimSpace(rest)
+
+	expr := &CaseWhenExpr{}
+	hasInput := false
+	// 简单 CASE（带输入）vs 搜索 CASE（无输入）
+	if !strings.HasPrefix(strings.ToUpper(rest), "WHEN") {
+		// 取到下一个 WHEN 之前作为 Input（Simple CASE 形式）
+		whenIdx := indexOfKeyword(rest, "WHEN")
+		if whenIdx < 0 {
+			return nil, fmt.Errorf("CASE missing WHEN")
+		}
+		inputStr := strings.TrimSpace(rest[:whenIdx])
+		// Simple CASE 的 input 必须是列引用（无引号标识符）
+		expr.Input = &ColumnExpr{Name: inputStr}
+		hasInput = true
+		rest = strings.TrimSpace(rest[whenIdx:])
+	}
+
+	for strings.HasPrefix(strings.ToUpper(rest), "WHEN") {
+		rest = strings.TrimSpace(rest[4:]) // 跳过 WHEN
+		// 取到 THEN 之前作为条件
+		thenIdx := indexOfKeyword(rest, "THEN")
+		if thenIdx < 0 {
+			return nil, fmt.Errorf("CASE WHEN missing THEN")
+		}
+		var cond Expression
+		var err error
+		if hasInput {
+			// Simple CASE: WHEN 后的值是字面量
+			cond, err = toValueExpr(strings.TrimSpace(rest[:thenIdx])), error(nil)
+		} else {
+			// Searched CASE: 条件是布尔表达式
+			cond, err = ParseConditionExpression(strings.TrimSpace(rest[:thenIdx]))
+		}
+		if err != nil {
+			return nil, err
+		}
+		rest = strings.TrimSpace(rest[thenIdx+4:]) // 跳过 THEN
+		// 条件后的 THEN result 块取到下一个 WHEN / ELSE / END
+		endIdx := nextCaseBoundary(rest)
+		if endIdx < 0 {
+			return nil, fmt.Errorf("CASE THEN missing END")
+		}
+		result, err := ParseValueExpression(strings.TrimSpace(rest[:endIdx]))
+		if err != nil {
+			return nil, err
+		}
+		expr.WhenClauses = append(expr.WhenClauses, CaseWhenClause{
+			Condition: cond,
+			Result:    result,
+		})
+		rest = strings.TrimSpace(rest[endIdx:])
+	}
+
+	if strings.HasPrefix(strings.ToUpper(rest), "ELSE") {
+		rest = strings.TrimSpace(rest[4:]) // 跳过 ELSE
+		endIdx := nextCaseBoundary(rest)
+		var elsePart string
+		if endIdx < 0 {
+			elsePart = strings.TrimSuffix(strings.TrimSpace(rest), "END")
+			rest = "END"
+		} else {
+			elsePart = strings.TrimSpace(rest[:endIdx])
+			rest = strings.TrimSpace(rest[endIdx:])
+		}
+		elseVal, err := ParseValueExpression(elsePart)
+		if err != nil {
+			return nil, err
+		}
+		expr.ElseValue = elseVal
+	}
+
+	if !strings.HasPrefix(strings.ToUpper(rest), "END") {
+		return nil, fmt.Errorf("CASE missing END, got: %q", rest)
+	}
+	return expr, nil
+}
+
+// indexOfKeyword 在顶层（括号外）查找大写关键字位置
+func indexOfKeyword(s, kw string) int {
+	upper := strings.ToUpper(s)
+	depth := 0
+	i := 0
+	for i < len(upper) {
+		c := upper[i]
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			depth--
+		} else if depth == 0 && i+len(kw) <= len(upper) && upper[i:i+len(kw)] == kw {
+			// 边界：前是空格/开始，后是空格/结束
+			prevOK := i == 0 || upper[i-1] == ' '
+			nextOK := i+len(kw) == len(upper) || upper[i+len(kw)] == ' '
+			if prevOK && nextOK {
+				return i
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+// nextCaseBoundary 返回下一个顶层 WHEN / ELSE / END 关键字位置
+func nextCaseBoundary(s string) int {
+	positions := []int{}
+	for _, kw := range []string{"WHEN", "ELSE", "END"} {
+		if idx := indexOfKeyword(s, kw); idx >= 0 {
+			positions = append(positions, idx)
+		}
+	}
+	if len(positions) == 0 {
+		return -1
+	}
+	min := positions[0]
+	for _, p := range positions[1:] {
+		if p < min {
+			min = p
+		}
+	}
+	return min
+}
+
+// parseFuncCall 解析简单函数调用 FUNCNAME(arg1, arg2, ...)
+func parseFuncCall(s, name string, build func(args []Expression) (Expression, error)) (Expression, error) {
+	rest := strings.TrimSpace(s)
+	// Case-insensitive prefix trim (without mutating rest)
+	if len(rest) >= len(name) && strings.EqualFold(rest[:len(name)], name) {
+		rest = rest[len(name):]
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "(") {
+		return nil, fmt.Errorf("%s missing (", name)
+	}
+	if matched := matchParen(rest); matched != len(rest)-1 {
+		return nil, fmt.Errorf("%s paren not matched", name)
+	}
+	inner := rest[1 : len(rest)-1]
+	args, err := parseArgList(inner)
+	if err != nil {
+		return nil, err
+	}
+	return build(args)
+}
+
+func parseNullIfString(s string) (Expression, error) {
+	rest := strings.TrimSpace(s)
+	if len(rest) >= 6 && strings.EqualFold(rest[:6], "NULLIF") {
+		rest = rest[6:]
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "(") {
+		return nil, fmt.Errorf("NULLIF missing (")
+	}
+	if matched := matchParen(rest); matched != len(rest)-1 {
+		return nil, fmt.Errorf("NULLIF paren not matched")
+	}
+	inner := rest[1 : len(rest)-1]
+	args, err := parseArgList(inner)
+	if err != nil {
+		return nil, err
+	}
+	if len(args) != 2 {
+		return nil, fmt.Errorf("NULLIF expects 2 args, got %d", len(args))
+	}
+	return &NullIfExpr{First: args[0], Second: args[1]}, nil
+}
+
+func parseCastString(s string) (Expression, error) {
+	rest := strings.TrimSpace(s)
+	if len(rest) >= 4 && strings.EqualFold(rest[:4], "CAST") {
+		rest = rest[4:]
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "(") {
+		return nil, fmt.Errorf("CAST missing (")
+	}
+	if matched := matchParen(rest); matched != len(rest)-1 {
+		return nil, fmt.Errorf("CAST paren not matched")
+	}
+	inner := rest[1 : len(rest)-1]
+	// 期望格式: expr AS TYPE
+	asIdx := indexOfKeyword(inner, "AS")
+	if asIdx < 0 {
+		return nil, fmt.Errorf("CAST missing AS")
+	}
+	exprStr := strings.TrimSpace(inner[:asIdx])
+	typeStr := strings.TrimSpace(inner[asIdx+2:])
+	expr, err := ParseValueExpression(exprStr)
+	if err != nil {
+		return nil, err
+	}
+	return &CastExpr{Expr: expr, Type: typeStr}, nil
+}
+
+func parseArgList(s string) ([]Expression, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	parts := splitValueArgs(s)
+	out := make([]Expression, 0, len(parts))
+	for _, p := range parts {
+		// 函数参数：遵循 WQL 无双引号设计 - bare identifier 在值上下文视为字符串字面量
+		out = append(out, toValueExpr(strings.TrimSpace(p)))
+	}
+	return out, nil
+}
+
+func splitValueArgs(s string) []string {
+	var out []string
+	depth := 0
+	last := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, s[last:i])
+				last = i + 1
+			}
+		}
+	}
+	out = append(out, s[last:])
+	return out
+}
 // 支持: =, !=, <, <=, >, >=, AND, OR, NOT, IN, LIKE, IS NULL, IS NOT NULL, BETWEEN
 func ParseWhere(s string) (Expression, error) {
 	s = strings.TrimSpace(s)
@@ -678,4 +1049,186 @@ func toValueExpr(s string) Expression {
 	}
 	// WQL 无双引号设计：bare identifier 视为字符串字面量
 	return &LiteralExpr{Value: s}
+}
+
+// ===== 标量函数与 CASE 表达式 =====
+
+// CoalesceExpr COALESCE(expr1, expr2, ...) — 返回第一个非空参数
+type CoalesceExpr struct {
+	Args []Expression
+}
+
+func (e *CoalesceExpr) Evaluate(row map[string]interface{}) (interface{}, error) {
+	for _, arg := range e.Args {
+		v, err := arg.Evaluate(row)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
+			return v, nil
+		}
+	}
+	return nil, nil
+}
+
+func (e *CoalesceExpr) String() string {
+	parts := make([]string, len(e.Args))
+	for i, a := range e.Args {
+		parts[i] = a.String()
+	}
+	return fmt.Sprintf("COALESCE(%s)", strings.Join(parts, ", "))
+}
+
+// NullIfExpr NULLIF(expr1, expr2) — 若两值相等返回 NULL，否则返回 expr1
+type NullIfExpr struct {
+	First  Expression
+	Second Expression
+}
+
+func (e *NullIfExpr) Evaluate(row map[string]interface{}) (interface{}, error) {
+	v1, err := e.First.Evaluate(row)
+	if err != nil {
+		return nil, err
+	}
+	v2, err := e.Second.Evaluate(row)
+	if err != nil {
+		return nil, err
+	}
+	if compareForFilter(v1, v2) == 0 {
+		return nil, nil
+	}
+	return v1, nil
+}
+
+func (e *NullIfExpr) String() string {
+	return fmt.Sprintf("NULLIF(%s, %s)", e.First.String(), e.Second.String())
+}
+
+// CastExpr CAST(expr AS TYPE) — 类型转换
+type CastExpr struct {
+	Expr Expression
+	Type string
+}
+
+func (e *CastExpr) Evaluate(row map[string]interface{}) (interface{}, error) {
+	v, err := e.Expr.Evaluate(row)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+	return castValue(v, e.Type)
+}
+
+func (e *CastExpr) String() string {
+	return fmt.Sprintf("CAST(%s AS %s)", e.Expr.String(), e.Type)
+}
+
+// castValue 简单类型转换
+func castValue(v interface{}, t string) (interface{}, error) {
+	switch strings.ToUpper(t) {
+	case "INTEGER", "INT":
+		switch x := v.(type) {
+		case int64:
+			return x, nil
+		case int:
+			return int64(x), nil
+		case float64:
+			return int64(x), nil
+		}
+		if s, ok := v.(string); ok {
+			return strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		}
+		return nil, fmt.Errorf("cannot cast %T to INTEGER", v)
+	case "TEXT", "STRING", "VARCHAR":
+		return fmt.Sprintf("%v", v), nil
+	case "REAL", "FLOAT", "DOUBLE":
+		switch x := v.(type) {
+		case float64:
+			return x, nil
+		case int64:
+			return float64(x), nil
+		case int:
+			return float64(x), nil
+		}
+		if s, ok := v.(string); ok {
+			return strconv.ParseFloat(strings.TrimSpace(s), 64)
+		}
+		return nil, fmt.Errorf("cannot cast %T to REAL", v)
+	}
+	return v, nil
+}
+
+// CaseWhenExpr CASE WHEN cond THEN val ... [ELSE val] END
+type CaseWhenExpr struct {
+	// Optional: simple CASE input (CASE expr WHEN v THEN r)
+	Input Expression
+	// Searched CASE: list of WHEN conditions
+	WhenClauses []CaseWhenClause
+	ElseValue   Expression
+}
+
+type CaseWhenClause struct {
+	Condition Expression
+	Result    Expression
+}
+
+func (e *CaseWhenExpr) Evaluate(row map[string]interface{}) (interface{}, error) {
+	inputVal := interface{}(nil)
+	hasInput := false
+	if e.Input != nil {
+		v, err := e.Input.Evaluate(row)
+		if err != nil {
+			return nil, err
+		}
+		inputVal = v
+		hasInput = true
+	}
+	for _, w := range e.WhenClauses {
+		if hasInput {
+			// Simple CASE: inputVal = w.Condition（字面量）
+			cv, err := w.Condition.Evaluate(row)
+			if err != nil {
+				return nil, err
+			}
+			if compareForFilter(inputVal, cv) == 0 {
+				return w.Result.Evaluate(row)
+			}
+		} else {
+			// Searched CASE: w.Condition 是布尔表达式
+			match, err := w.Condition.Evaluate(row)
+			if err != nil {
+				return nil, err
+			}
+			if toBoolForFilter(match) {
+				return w.Result.Evaluate(row)
+			}
+		}
+	}
+	if e.ElseValue != nil {
+		return e.ElseValue.Evaluate(row)
+	}
+	return nil, nil
+}
+
+func (e *CaseWhenExpr) String() string {
+	var sb strings.Builder
+	sb.WriteString("CASE")
+	if e.Input != nil {
+		sb.WriteString(" ")
+		sb.WriteString(e.Input.String())
+	}
+	for _, w := range e.WhenClauses {
+		sb.WriteString(" WHEN ")
+		sb.WriteString(w.Condition.String())
+		sb.WriteString(" THEN ")
+		sb.WriteString(w.Result.String())
+	}
+	if e.ElseValue != nil {
+		sb.WriteString(" ELSE ")
+		sb.WriteString(e.ElseValue.String())
+	}
+	sb.WriteString(" END")
+	return sb.String()
 }
