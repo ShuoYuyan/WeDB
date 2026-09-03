@@ -897,7 +897,8 @@ func (p *Parser) parsePrimaryExpression() (Expression, error) {
 		p.nextToken()
 		return expr, nil
 	case lexer.TOKEN_IDENTIFIER, lexer.TOKEN_COUNT, lexer.TOKEN_SUM, lexer.TOKEN_AVG, lexer.TOKEN_MIN, lexer.TOKEN_MAX,
-		lexer.TOKEN_JSON_EXTRACT, lexer.TOKEN_JSON_QUERY, lexer.TOKEN_JSON_VALUE:
+		lexer.TOKEN_JSON_EXTRACT, lexer.TOKEN_JSON_QUERY, lexer.TOKEN_JSON_VALUE,
+		lexer.TOKEN_COALESCE, lexer.TOKEN_NULLIF, lexer.TOKEN_CAST:
 		// 支持带点的标识符，如 users.id
 		value := p.currentToken.Value
 		p.nextToken()
@@ -925,6 +926,10 @@ func (p *Parser) parsePrimaryExpression() (Expression, error) {
 
 		return &Identifier{Value: value}, nil
 	case lexer.TOKEN_INTEGER, lexer.TOKEN_FLOAT, lexer.TOKEN_STRING, lexer.TOKEN_BOOLEAN:
+		value := p.currentToken.Value
+		p.nextToken()
+		return &LiteralExpression{Value: value}, nil
+	case lexer.TOKEN_INTEGER_TYPE, lexer.TOKEN_TEXT_TYPE, lexer.TOKEN_REAL_TYPE, lexer.TOKEN_BLOB_TYPE:
 		value := p.currentToken.Value
 		p.nextToken()
 		return &LiteralExpression{Value: value}, nil
@@ -1095,30 +1100,71 @@ func isPostfixNotOp(tokenType lexer.TokenType) bool {
 //   - 普通函数调用：Count(), Sum(amount), Avg(price)
 //   - IN 表达式：IN (1, 2, 3) — 但 IN 是关键字而非列名，因此由 parsePrimaryExpression 直接处理
 //   - 关键字调用：Count/Sum/Avg/Min/Max 走函数调用
+//   - COALESCE / NULLIF / CAST 转成对应的 typed AST
 func (p *Parser) parseFunctionOrInCall(name string) (Expression, error) {
-	// 进入时 currentToken 已经在左括号
-	p.nextToken() // 跳过左括号
-
+	upper := strings.ToUpper(name)
+	// 跳过左括号
+	p.nextToken()
 	args := []Expression{}
-
 	for p.currentToken.Type != lexer.TOKEN_RPAREN {
+		// CAST 特殊处理：第一个 arg 之后必须跟着 AS <type>
 		arg, err := p.parseExpression()
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, arg)
-
 		if p.currentToken.Type == lexer.TOKEN_COMMA {
 			p.nextToken()
+		} else if upper == "CAST" && p.currentToken.Type == lexer.TOKEN_AS {
+			// CAST 的 AS 关键字：消耗它，然后读 type
+			p.nextToken()
+			typeArg, err := p.parsePrimaryExpression()
+			if err != nil {
+				return nil, fmt.Errorf("CAST expects type after AS: %w", err)
+			}
+			args = append(args, typeArg)
 		}
 	}
-
 	p.nextToken() // 跳过右括号
 
-	return &FunctionCallExpression{
-		Name:      name,
-		Arguments: args,
-	}, nil
+	// 特殊函数转为强类型 AST
+	switch upper {
+	case "COALESCE":
+		return &CoalesceExpression{Args: args}, nil
+	case "NULLIF":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("NULLIF requires 2 arguments, got %d", len(args))
+		}
+		return &NullIfExpression{A: args[0], B: args[1]}, nil
+	case "CAST":
+		// 特殊语法：CAST(expr AS TYPE)
+		// 期望：args 包含两个元素——args[0] = expression, args[1] = type
+		// 解析器已经把 "AS" 当作未知 token，所以这里采用更宽松的处理：
+		// 如果 args 是 [expr, "AS", type]（AS 被解析为 Identifier），合并。
+		// 简化：如果 args[0] 是 Identifier 且 args[0].Value == "AS"，跳过；
+		// 类似地处理后续。
+		// 但更稳妥：识别 args[1] 是否含 AS 关键字。
+		if len(args) >= 2 {
+			// 期望 args[0] = expr, args[1] = AS, args[2] = type（如果有 AS）
+			// 但 parseExpression 不把 AS 当作 binary，所以 args[0] = expr, args[1] 不会包含 AS。
+			// 我们改用 lexeme 匹配：如果第一个 token 在 args[0] 后是 AS，应当作为关键字处理。
+			// 简单 fallback：args[0] 是 expr，args[1] 是 type 字符串。
+			return &CastExpression{Expr: args[0], Type: exprToStringStatic(args[1])}, nil
+		}
+		return nil, fmt.Errorf("CAST requires 'expr AS TYPE'")
+	}
+
+	return &FunctionCallExpression{Name: name, Arguments: args}, nil
+}
+
+func exprToStringStatic(e Expression) string {
+	if e == nil {
+		return ""
+	}
+	if id, ok := e.(*Identifier); ok {
+		return id.Value
+	}
+	return e.String()
 }
 
 func (p *Parser) parseFunctionCall(funcName string) (Expression, error) {

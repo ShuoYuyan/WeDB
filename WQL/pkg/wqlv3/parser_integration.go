@@ -608,6 +608,16 @@ func astToString(e parser.Expression) string {
 			args[i] = astToString(a)
 		}
 		return fmt.Sprintf("%s(%s)", v.Name, joinArgs(args))
+	case *parser.CoalesceExpression:
+		args := make([]string, len(v.Args))
+		for i, a := range v.Args {
+			args[i] = astToString(a)
+		}
+		return fmt.Sprintf("COALESCE(%s)", joinArgs(args))
+	case *parser.NullIfExpression:
+		return fmt.Sprintf("NULLIF(%s, %s)", astToString(v.A), astToString(v.B))
+	case *parser.CastExpression:
+		return fmt.Sprintf("CAST(%s AS %s)", astToString(v.Expr), v.Type)
 	case *parser.CallExpression:
 		args := make([]string, len(v.Arguments))
 		for i, a := range v.Arguments {

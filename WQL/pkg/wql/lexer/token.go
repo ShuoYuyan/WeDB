@@ -104,6 +104,10 @@ const (
 	TOKEN_HAVING
 	TOKEN_UNION
 	TOKEN_UNION_ALL
+	// Built-in functions (executable as scalar expressions)
+	TOKEN_COALESCE
+	TOKEN_NULLIF
+	TOKEN_CAST
 	TOKEN_INTERSECT
 	TOKEN_EXCEPT
 	TOKEN_AS
@@ -260,6 +264,9 @@ var keywords = map[string]TokenType{
 	"NOT":        TOKEN_NOT,
 	"LIKE":       TOKEN_LIKE,
 	"IN":         TOKEN_IN,
+	"COALESCE":   TOKEN_COALESCE,
+	"NULLIF":     TOKEN_NULLIF,
+	"CAST":       TOKEN_CAST,
 	"BETWEEN":    TOKEN_BETWEEN,
 	"IS":         TOKEN_IS,
 	"NULL":       TOKEN_NULL,

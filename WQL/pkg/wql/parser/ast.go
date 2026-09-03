@@ -608,6 +608,45 @@ func (e *IsNullExpression) String() string {
 
 func (e *IsNullExpression) expressionNode() {}
 
+// CoalesceExpression COALESCE(a, b, c, ...) — 第一个非 NULL 值
+type CoalesceExpression struct {
+	Args []Expression
+}
+
+func (e *CoalesceExpression) String() string {
+	parts := make([]string, len(e.Args))
+	for i, a := range e.Args {
+		parts[i] = a.String()
+	}
+	return fmt.Sprintf("COALESCE(%s)", strings.Join(parts, ", "))
+}
+
+func (e *CoalesceExpression) expressionNode() {}
+
+// NullIfExpression NULLIF(a, b) — a == b 时返回 NULL，否则返回 a
+type NullIfExpression struct {
+	A Expression
+	B Expression
+}
+
+func (e *NullIfExpression) String() string {
+	return fmt.Sprintf("NULLIF(%s, %s)", e.A, e.B)
+}
+
+func (e *NullIfExpression) expressionNode() {}
+
+// CastExpression CAST(expr AS TYPE) — 类型转换
+type CastExpression struct {
+	Expr Expression
+	Type string
+}
+
+func (e *CastExpression) String() string {
+	return fmt.Sprintf("CAST(%s AS %s)", e.Expr, e.Type)
+}
+
+func (e *CastExpression) expressionNode() {}
+
 // DistinctOperation DISTINCT 去重操作
 type DistinctOperation struct {
 	Columns []Expression
