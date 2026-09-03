@@ -353,16 +353,29 @@ func (m *mockAdapter) Avg(tableName, column, condition string) (float64, error) 
 
 // BeginTransaction mock 实现
 func (m *mockAdapter) BeginTransaction() (Transaction, error) {
-	return &mockTx{active: true}, nil
+	return &mockTx{adapter: m, active: true}, nil
 }
 
 type mockTx struct {
-	active bool
+	adapter *mockAdapter
+	active  bool
 }
 
 func (t *mockTx) Commit() error   { t.active = false; return nil }
 func (t *mockTx) Rollback() error { t.active = false; return nil }
 func (t *mockTx) IsActive() bool  { return t.active }
+func (t *mockTx) InsertRow(tableName string, row map[string]interface{}) error {
+	return t.adapter.InsertRow(tableName, row)
+}
+func (t *mockTx) InsertRows(tableName string, rows []map[string]interface{}) error {
+	return t.adapter.InsertRows(tableName, rows)
+}
+func (t *mockTx) UpdateRow(tableName string, row map[string]interface{}, condition string) error {
+	return t.adapter.UpdateRow(tableName, row, condition)
+}
+func (t *mockTx) DeleteRow(tableName string, condition string) error {
+	return t.adapter.DeleteRow(tableName, condition)
+}
 
 func filterByCondition(rows []map[string]interface{}, condition string) ([]map[string]interface{}, error) {
 	if condition == "" {

@@ -454,7 +454,7 @@ func ParseWhere(s string) (Expression, error) {
 			right := strings.TrimSpace(s[idx+len(op):])
 			return &BinaryExpr{
 				Left:  toExprHelper(left),
-				Right: toExprHelper(right),
+				Right: toValueExpr(right),
 				Op:    op,
 			}, nil
 		}
@@ -640,4 +640,42 @@ func parseValue(s string) (interface{}, error) {
 		return f, nil
 	}
 	return s, nil
+}
+
+// toValueExpr 把字符串解析为 value 位置的表达式
+// WQL 无双引号设计：在 value 位置上的 bare identifier 视为字符串字面量
+// （除非是带点的复合标识符如 users.id，那视为列引用——但这种情况在 SQL 中不会用 = 右侧）
+func toValueExpr(s string) Expression {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') ||
+			(s[0] == '\'' && s[len(s)-1] == '\'') {
+			return &LiteralExpr{Value: s[1 : len(s)-1]}
+		}
+	}
+	// 数字
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return &LiteralExpr{Value: i}
+	}
+	// 浮点
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return &LiteralExpr{Value: f}
+	}
+	// 布尔
+	upper := strings.ToUpper(s)
+	if upper == "TRUE" {
+		return &LiteralExpr{Value: true}
+	}
+	if upper == "FALSE" {
+		return &LiteralExpr{Value: false}
+	}
+	if upper == "NULL" {
+		return &LiteralExpr{Value: nil}
+	}
+	// 复合列引用（table.col）
+	if strings.Contains(s, ".") {
+		return &ColumnExpr{Name: s}
+	}
+	// WQL 无双引号设计：bare identifier 视为字符串字面量
+	return &LiteralExpr{Value: s}
 }

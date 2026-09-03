@@ -477,8 +477,8 @@ func (a *ArrayExpression) expressionNode() {}
 
 // UnionOperation UNION操作
 type UnionOperation struct {
-	Table    Expression
-	All      bool
+	Table *WQLQuery
+	All   bool
 }
 
 func (u *UnionOperation) String() string {
@@ -492,7 +492,7 @@ func (u *UnionOperation) operationNode() {}
 
 // IntersectOperation INTERSECT操作
 type IntersectOperation struct {
-	Table Expression
+	Table *WQLQuery
 }
 
 func (i *IntersectOperation) String() string {
@@ -503,7 +503,7 @@ func (i *IntersectOperation) operationNode() {}
 
 // ExceptOperation EXCEPT操作
 type ExceptOperation struct {
-	Table Expression
+	Table *WQLQuery
 }
 
 func (e *ExceptOperation) String() string {

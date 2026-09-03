@@ -226,9 +226,10 @@ func (w *WeDBAdapter) convertSchema(s *TableSchema) *api.TableSchema {
 	cols := make([]api.ColumnSchema, len(s.Columns))
 	for i, c := range s.Columns {
 		cols[i] = api.ColumnSchema{
-			Name:     c.Name,
-			Type:     api.ColumnType(c.Type),
-			Nullable: c.Nullable,
+			Name:       c.Name,
+			Type:       api.ColumnType(c.Type),
+			Nullable:   c.Nullable,
+			PrimaryKey: c.Primary,
 		}
 	}
 	return &api.TableSchema{
@@ -244,6 +245,7 @@ func (w *WeDBAdapter) convertFromAPISchema(s *api.TableSchema) *TableSchema {
 			Name:     c.Name,
 			Type:     string(c.Type),
 			Nullable: c.Nullable,
+			Primary:  c.PrimaryKey,
 		}
 	}
 	return &TableSchema{Name: s.TableName, Columns: cols}
@@ -257,7 +259,7 @@ func (w *WeDBAdapter) BeginTx(ctx context.Context, opts *api.TxOptions) (Transac
 	if err != nil {
 		return nil, err
 	}
-	return &weDBTx{tx: tx, active: true}, nil
+	return &weDBTx{tx: tx, active: true, wedb: w.db}, nil
 }
 
 // BeginTransaction 开始默认事务（满足 wqlv3.Adapter 接口）
@@ -266,15 +268,25 @@ func (w *WeDBAdapter) BeginTransaction() (Transaction, error) {
 }
 
 // Transaction 事务接口
+// DML 操作在事务内执行，使 INSERT/UPDATE/DELETE 满足 ACID。
+// 实现策略：weDBDatabase.BeginTx() 会把 tx 设为 db.curWriteTx，
+// 此后 db.InsertRow/UpdateRow/DeleteRow 自动通过 tx.stageXXX 暂存，
+// Commit 时一次性落盘，Rollback 时丢弃暂存。
 type Transaction interface {
 	Commit() error
 	Rollback() error
 	IsActive() bool
+	// DML in tx
+	InsertRow(tableName string, row map[string]interface{}) error
+	InsertRows(tableName string, rows []map[string]interface{}) error
+	UpdateRow(tableName string, row map[string]interface{}, condition string) error
+	DeleteRow(tableName string, condition string) error
 }
 
 type weDBTx struct {
 	tx     api.Transaction
 	active bool
+	wedb   *storage.WeDBDatabase
 }
 
 func (t *weDBTx) Commit() error {
@@ -292,6 +304,18 @@ func (t *weDBTx) Rollback() error {
 	return t.tx.Rollback()
 }
 func (t *weDBTx) IsActive() bool { return t.active }
+func (t *weDBTx) InsertRow(tableName string, row map[string]interface{}) error {
+	return t.wedb.InsertRow(tableName, row)
+}
+func (t *weDBTx) InsertRows(tableName string, rows []map[string]interface{}) error {
+	return t.wedb.InsertRows(tableName, rows)
+}
+func (t *weDBTx) UpdateRow(tableName string, row map[string]interface{}, condition string) error {
+	return t.wedb.UpdateRow(tableName, row, condition)
+}
+func (t *weDBTx) DeleteRow(tableName string, condition string) error {
+	return t.wedb.DeleteRow(tableName, condition)
+}
 
 // ===== 表达式引擎（内部 WHERE 解析辅助） =====
 

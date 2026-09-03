@@ -202,6 +202,7 @@ func objectLiteralToMap(obj *parser.ObjectLiteralExpression) map[string]interfac
 
 // literalValue 取字面量表达式的 Go 原生值
 // 数字字符串自动转为 int64/float64，布尔转为 bool
+// 关键：Identifier 在 value 位置视为字符串字面量（无双引号设计原则）
 func literalValue(e parser.Expression) interface{} {
 	switch v := e.(type) {
 	case *parser.LiteralExpression:
@@ -226,6 +227,12 @@ func literalValue(e parser.Expression) interface{} {
 		}
 		return v.Value
 	case *parser.Identifier:
+		// 无双引号原则：value 位置上的 Identifier 视为字符串字面量
+		// 但要排除明显的列引用（如 users.id 形式）
+		if strings.Contains(v.Value, ".") {
+			// 带点的视为列引用，不作为值
+			return nil
+		}
 		return v.Value
 	}
 	return exprToString(e)
@@ -236,6 +243,12 @@ func literalValue(e parser.Expression) interface{} {
 // 然后处理 SELECT 终结符（All/First）。
 func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (QueryResult, error) {
 	result := QueryResult{Rows: nil}
+	return runOperations(db, qb, ops, result)
+}
+
+// runOperations 是 executeQuery 的可复用核心，result 由调用方提供以便
+// 在子查询场景下复用该结构体。
+func runOperations(db *Database, qb *QueryBuilder, ops []parser.Operation, result QueryResult) (QueryResult, error) {
 
 	// 检查是否包含 DML/DDL 操作
 	hasDML := false
@@ -295,7 +308,11 @@ func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (Query
 			case *parser.CreateTableOperation:
 				cols := make([]*ColumnDef, 0, len(o.Columns))
 				for _, col := range o.Columns {
-					cols = append(cols, NewColumn(col.Name, col.Type, col.Nullable))
+					c := NewColumn(col.Name, col.Type, col.Nullable)
+					if col.Primary {
+						c.Primary = true
+					}
+					cols = append(cols, c)
 				}
 				if err := db.CreateTable(NewTableSchema(qb.tableName, cols...)); err != nil {
 					return result, err
@@ -356,75 +373,194 @@ func executeQuery(db *Database, qb *QueryBuilder, ops []parser.Operation) (Query
 		}
 	}
 
-	// SELECT 终结符
-	for i := len(ops) - 1; i >= 0; i-- {
-		op := ops[i]
-		switch op.(type) {
-		case *parser.AllOperation:
-			rows, err := qb.All()
-			if err != nil {
-				return result, err
+	// SELECT 终结符：处理 select terminator，然后处理 set-op（Union/Intersect/Except）
+	// 集操作可以出现在终结符之前（先 Union 再 All）或之后（先 All 再 Union——少见但允许）
+	// 我们分两段：先找到终结符索引，将终结符之前的 set-op 缓存，调用终结方法，
+	// 最后按出现顺序处理 set-op。
+	terminatorIdx := -1
+	for i, op := range ops {
+		if _, ok := op.(*parser.AllOperation); ok {
+			if terminatorIdx == -1 {
+				terminatorIdx = i
 			}
-			result.Rows = rows
-			return result, nil
-		case *parser.FirstOperation:
-			row, err := qb.First()
-			if err != nil {
-				return result, err
+		} else if _, ok := op.(*parser.FirstOperation); ok {
+			if terminatorIdx == -1 {
+				terminatorIdx = i
 			}
-			if row != nil {
-				result.Rows = []map[string]interface{}{row}
+		} else if _, ok := op.(*parser.AggregateOperation); ok {
+			if terminatorIdx == -1 {
+				terminatorIdx = i
 			}
-			return result, nil
-		case *parser.AggregateOperation:
-			o := op.(*parser.AggregateOperation)
-			col := ""
-			if o.Column != nil {
-				col = exprToString(o.Column)
-			}
-			switch o.Function {
-			case "Count":
-				v, err := qb.Count()
-				if err != nil {
-					return result, err
-				}
-				result.Value = v
-			case "Sum":
-				v, err := qb.Sum(col)
-				if err != nil {
-					return result, err
-				}
-				result.Value = v
-			case "Avg":
-				v, err := qb.Avg(col)
-				if err != nil {
-					return result, err
-				}
-				result.Value = v
-			case "Min":
-				v, err := qb.Min(col)
-				if err != nil {
-					return result, err
-				}
-				result.Value = v
-			case "Max":
-				v, err := qb.Max(col)
-				if err != nil {
-					return result, err
-				}
-				result.Value = v
-			}
-			return result, nil
 		}
 	}
 
-	// 没有显式终结操作时，默认执行 All
-	rows, err := qb.All()
-	if err != nil {
-		return result, err
+	// 主查询执行
+	terminatorOp := parser.Operation(nil)
+	if terminatorIdx >= 0 {
+		terminatorOp = ops[terminatorIdx]
 	}
-	result.Rows = rows
+
+	switch o := terminatorOp.(type) {
+	case *parser.AllOperation:
+		rows, err := qb.All()
+		if err != nil {
+			return result, err
+		}
+		result.Rows = rows
+	case *parser.FirstOperation:
+		row, err := qb.First()
+		if err != nil {
+			return result, err
+		}
+		if row != nil {
+			result.Rows = []map[string]interface{}{row}
+		}
+	case *parser.AggregateOperation:
+		col := ""
+		if o.Column != nil {
+			col = exprToString(o.Column)
+		}
+		switch o.Function {
+		case "Count":
+			v, err := qb.Count()
+			if err != nil {
+				return result, err
+			}
+			result.Value = v
+		case "Sum":
+			v, err := qb.Sum(col)
+			if err != nil {
+				return result, err
+			}
+			result.Value = v
+		case "Avg":
+			v, err := qb.Avg(col)
+			if err != nil {
+				return result, err
+			}
+			result.Value = v
+		case "Min":
+			v, err := qb.Min(col)
+			if err != nil {
+				return result, err
+			}
+			result.Value = v
+		case "Max":
+			v, err := qb.Max(col)
+			if err != nil {
+				return result, err
+			}
+			result.Value = v
+		}
+	default:
+		// 没有显式终结操作时，默认执行 All
+		rows, err := qb.All()
+		if err != nil {
+			return result, err
+		}
+		result.Rows = rows
+	}
+
+	// 处理 set-op（按出现顺序，无论在终结符之前或之后）
+	// set-op 总是紧跟着它前面的"主查询行"进行合并。
+	// 策略：取所有 set-op 位置，按 ops 顺序依次处理。
+	var setOps []int
+	for i, op := range ops {
+		switch op.(type) {
+		case *parser.UnionOperation, *parser.IntersectOperation, *parser.ExceptOperation:
+			setOps = append(setOps, i)
+		}
+	}
+	for _, i := range setOps {
+		switch setOp := ops[i].(type) {
+		case *parser.UnionOperation:
+			other, err := runSubQuery(db, setOp.Table)
+			if err != nil {
+				return result, err
+			}
+			result.Rows = unionRows(result.Rows, other, setOp.All)
+		case *parser.IntersectOperation:
+			other, err := runSubQuery(db, setOp.Table)
+			if err != nil {
+				return result, err
+			}
+			result.Rows = intersectRows(result.Rows, other)
+		case *parser.ExceptOperation:
+			other, err := runSubQuery(db, setOp.Table)
+			if err != nil {
+				return result, err
+			}
+			result.Rows = exceptRows(result.Rows, other)
+		}
+	}
 	return result, nil
+}
+
+// runSubQuery 在子查询上下文中执行 *WQLQuery（仅 SELECT 路径）
+func runSubQuery(db *Database, sub *parser.WQLQuery) ([]map[string]interface{}, error) {
+	if sub == nil {
+		return nil, fmt.Errorf("nil subquery")
+	}
+	qb, err := buildQueryBuilder(db, sub)
+	if err != nil {
+		return nil, err
+	}
+	res, err := runOperations(db, qb, sub.Operations, QueryResult{})
+	if err != nil {
+		return nil, err
+	}
+	return res.Rows, nil
+}
+
+// unionRows 合并两组行（去重或不去重）
+func unionRows(a, b []map[string]interface{}, all bool) []map[string]interface{} {
+	if all {
+		out := make([]map[string]interface{}, 0, len(a)+len(b))
+		out = append(out, a...)
+		out = append(out, b...)
+		return out
+	}
+	seen := map[string]bool{}
+	out := make([]map[string]interface{}, 0, len(a)+len(b))
+	for _, r := range append(a, b...) {
+		k := rowKey(r, nil)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+// intersectRows 返回 a 与 b 的交集
+func intersectRows(a, b []map[string]interface{}) []map[string]interface{} {
+	bKeys := map[string]bool{}
+	for _, r := range b {
+		bKeys[rowKey(r, nil)] = true
+	}
+	out := make([]map[string]interface{}, 0, len(a))
+	for _, r := range a {
+		if bKeys[rowKey(r, nil)] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// exceptRows 返回 a - b（左差集）
+func exceptRows(a, b []map[string]interface{}) []map[string]interface{} {
+	bKeys := map[string]bool{}
+	for _, r := range b {
+		bKeys[rowKey(r, nil)] = true
+	}
+	out := make([]map[string]interface{}, 0, len(a))
+	for _, r := range a {
+		if !bKeys[rowKey(r, nil)] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // findWhereAfter 查找 ops 中 target 之后最近的一个 WhereOperation
@@ -530,24 +666,13 @@ func astToString(e parser.Expression) string {
 }
 
 // literalToString 将字面量值转为字符串
-// 字符串加引号，其他类型不加
+// WQL 无双引号设计：字符串值不加引号（数字/布尔/null 同样不加）
+// 在 value 位置上，bare identifier 也视为字符串字面量。
 func literalToString(v interface{}) string {
 	switch val := v.(type) {
 	case string:
-		// 检测数字/布尔/null 字符串（来自 lexer），不加引号
-		if val == "true" || val == "false" || val == "null" {
-			return val
-		}
-		if _, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return val
-		}
-		if _, err := strconv.ParseFloat(val, 64); err == nil {
-			return val
-		}
-		// 真正的字符串字面量才加引号
-		escaped := strings.ReplaceAll(val, `\`, `\\`)
-		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-		return fmt.Sprintf(`"%s"`, escaped)
+		// 真正的字符串：无双引号设计原则
+		return val
 	case bool:
 		if val {
 			return "true"
@@ -558,7 +683,6 @@ func literalToString(v interface{}) string {
 	case int, int32, int64, uint, uint32, uint64, float32, float64:
 		return fmt.Sprintf("%v", val)
 	default:
-		// 数字、布尔等直接用 %v
 		return fmt.Sprintf("%v", val)
 	}
 }

@@ -98,6 +98,7 @@ type ColumnDef struct {
 	Name     string
 	Type     string
 	Nullable bool
+	Primary  bool
 }
 
 // Close 关闭数据库连接
@@ -114,8 +115,10 @@ func (d *Database) Ping() error {
 
 // InsertBuilder 插入数据构建器
 // 用法: db.Insert("users").Values(row1, row2, ...).Execute()
+// 如果 Database 持有 currentTx，DML 会自动在该事务中执行。
 type InsertBuilder struct {
 	db        Adapter
+	tx        Transaction
 	tableName string
 	rows      []map[string]interface{}
 }
@@ -136,6 +139,17 @@ func (ib *InsertBuilder) Execute() (int64, error) {
 	if len(ib.rows) == 0 {
 		return 0, fmt.Errorf("no rows to insert")
 	}
+	if ib.tx != nil && ib.tx.IsActive() {
+		if err := ib.tx.InsertRow(ib.tableName, ib.rows[0]); err != nil {
+			return 0, err
+		}
+		for _, r := range ib.rows[1:] {
+			if err := ib.tx.InsertRow(ib.tableName, r); err != nil {
+				return 0, err
+			}
+		}
+		return int64(len(ib.rows)), nil
+	}
 	if len(ib.rows) == 1 {
 		if err := ib.db.InsertRow(ib.tableName, ib.rows[0]); err != nil {
 			return 0, err
@@ -154,6 +168,7 @@ func (ib *InsertBuilder) Execute() (int64, error) {
 // 用法: db.Update("users").Set("name", "bob").Where("id = 1").Execute()
 type UpdateBuilder struct {
 	db        Adapter
+	tx        Transaction
 	tableName string
 	updates   map[string]interface{}
 	condition string
@@ -187,6 +202,12 @@ func (ub *UpdateBuilder) Execute() (int64, error) {
 	if ub.condition == "" {
 		return 0, fmt.Errorf("UPDATE without WHERE is not allowed for safety")
 	}
+	if ub.tx != nil && ub.tx.IsActive() {
+		if err := ub.tx.UpdateRow(ub.tableName, ub.updates, ub.condition); err != nil {
+			return 0, err
+		}
+		return -1, nil
+	}
 	if err := ub.db.UpdateRow(ub.tableName, ub.updates, ub.condition); err != nil {
 		return 0, err
 	}
@@ -199,6 +220,7 @@ func (ub *UpdateBuilder) Execute() (int64, error) {
 // 用法: db.Delete("users").Where("age < 18").Execute()
 type DeleteBuilder struct {
 	db        Adapter
+	tx        Transaction
 	tableName string
 	condition string
 }
@@ -213,6 +235,12 @@ func (db *DeleteBuilder) Where(condition string) *DeleteBuilder {
 func (db *DeleteBuilder) Execute() (int64, error) {
 	if db.condition == "" {
 		return 0, fmt.Errorf("DELETE without WHERE is not allowed for safety")
+	}
+	if db.tx != nil && db.tx.IsActive() {
+		if err := db.tx.DeleteRow(db.tableName, db.condition); err != nil {
+			return 0, err
+		}
+		return -1, nil
 	}
 	if err := db.db.DeleteRow(db.tableName, db.condition); err != nil {
 		return 0, err
@@ -272,6 +300,7 @@ func (d *Database) Table(name string) *QueryBuilder {
 func (d *Database) Insert(tableName string) *InsertBuilder {
 	return &InsertBuilder{
 		db:        d.adapter,
+		tx:        d.currentTx,
 		tableName: tableName,
 	}
 }
@@ -281,6 +310,7 @@ func (d *Database) Insert(tableName string) *InsertBuilder {
 func (d *Database) Update(tableName string) *UpdateBuilder {
 	return &UpdateBuilder{
 		db:        d.adapter,
+		tx:        d.currentTx,
 		tableName: tableName,
 		updates:   make(map[string]interface{}),
 	}
@@ -291,6 +321,7 @@ func (d *Database) Update(tableName string) *UpdateBuilder {
 func (d *Database) Delete(tableName string) *DeleteBuilder {
 	return &DeleteBuilder{
 		db:        d.adapter,
+		tx:        d.currentTx,
 		tableName: tableName,
 	}
 }

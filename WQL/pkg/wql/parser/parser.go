@@ -557,22 +557,39 @@ func (p *Parser) parseUnionOperation() (*UnionOperation, error) {
 	if p.currentToken.Type != lexer.TOKEN_LPAREN {
 		return nil, fmt.Errorf("expected '(', got %s", p.currentToken.Type)
 	}
-
 	p.nextToken()
 
-	table, err := p.parseExpression()
+	// 收集从当前位置到匹配右括号的 token，并保持括号嵌套
+	// 期望子查询以 db.Table(...) 开头
+	var tokens []lexer.Token
+	parenLevel := 1 // 跨过左括号
+	for {
+		if p.currentToken.Type == lexer.TOKEN_LPAREN {
+			parenLevel++
+		} else if p.currentToken.Type == lexer.TOKEN_RPAREN {
+			parenLevel--
+			if parenLevel == 0 {
+				break
+			}
+		} else if p.currentToken.Type == lexer.TOKEN_EOF {
+			return nil, fmt.Errorf("unterminated Union subquery")
+		}
+		tokens = append(tokens, p.currentToken)
+		p.nextToken()
+	}
+	p.nextToken() // 跳过 RPAREN
+
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("empty Union subquery")
+	}
+
+	subQuery, err := tokensToSubquery(tokens)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse Union subquery: %w", err)
 	}
-
-	if p.currentToken.Type != lexer.TOKEN_RPAREN {
-		return nil, fmt.Errorf("expected ')', got %s", p.currentToken.Type)
-	}
-
-	p.nextToken()
 
 	return &UnionOperation{
-		Table: table,
+		Table: subQuery,
 		All:   all,
 	}, nil
 }
@@ -584,21 +601,36 @@ func (p *Parser) parseIntersectOperation() (*IntersectOperation, error) {
 	if p.currentToken.Type != lexer.TOKEN_LPAREN {
 		return nil, fmt.Errorf("expected '(', got %s", p.currentToken.Type)
 	}
-
 	p.nextToken()
 
-	table, err := p.parseExpression()
+	var tokens []lexer.Token
+	parenLevel := 1
+	for {
+		if p.currentToken.Type == lexer.TOKEN_LPAREN {
+			parenLevel++
+		} else if p.currentToken.Type == lexer.TOKEN_RPAREN {
+			parenLevel--
+			if parenLevel == 0 {
+				break
+			}
+		} else if p.currentToken.Type == lexer.TOKEN_EOF {
+			return nil, fmt.Errorf("unterminated Intersect subquery")
+		}
+		tokens = append(tokens, p.currentToken)
+		p.nextToken()
+	}
+	p.nextToken()
+
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("empty Intersect subquery")
+	}
+
+	subQuery, err := tokensToSubquery(tokens)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse Intersect subquery: %w", err)
 	}
 
-	if p.currentToken.Type != lexer.TOKEN_RPAREN {
-		return nil, fmt.Errorf("expected ')', got %s", p.currentToken.Type)
-	}
-
-	p.nextToken()
-
-	return &IntersectOperation{Table: table}, nil
+	return &IntersectOperation{Table: subQuery}, nil
 }
 
 // parseExceptOperation 解析EXCEPT操作
@@ -608,21 +640,50 @@ func (p *Parser) parseExceptOperation() (*ExceptOperation, error) {
 	if p.currentToken.Type != lexer.TOKEN_LPAREN {
 		return nil, fmt.Errorf("expected '(', got %s", p.currentToken.Type)
 	}
-
 	p.nextToken()
 
-	table, err := p.parseExpression()
+	var tokens []lexer.Token
+	parenLevel := 1
+	for {
+		if p.currentToken.Type == lexer.TOKEN_LPAREN {
+			parenLevel++
+		} else if p.currentToken.Type == lexer.TOKEN_RPAREN {
+			parenLevel--
+			if parenLevel == 0 {
+				break
+			}
+		} else if p.currentToken.Type == lexer.TOKEN_EOF {
+			return nil, fmt.Errorf("unterminated Except subquery")
+		}
+		tokens = append(tokens, p.currentToken)
+		p.nextToken()
+	}
+	p.nextToken()
+
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("empty Except subquery")
+	}
+
+	subQuery, err := tokensToSubquery(tokens)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse Except subquery: %w", err)
 	}
 
-	if p.currentToken.Type != lexer.TOKEN_RPAREN {
-		return nil, fmt.Errorf("expected ')', got %s", p.currentToken.Type)
+	return &ExceptOperation{Table: subQuery}, nil
+}
+
+// tokensToSubquery 从 token 序列重建字符串并解析为 *WQLQuery
+func tokensToSubquery(tokens []lexer.Token) (*WQLQuery, error) {
+	var sb strings.Builder
+	for i, t := range tokens {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(t.Value)
 	}
-
-	p.nextToken()
-
-	return &ExceptOperation{Table: table}, nil
+	subLexer := lexer.NewLexer(sb.String())
+	subParser := NewParser(subLexer)
+	return subParser.Parse()
 }
 
 // parseExpression 解析表达式
